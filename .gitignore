@@ -1,0 +1,11 @@
+# 빌드 산출물 (컴파일러가 자동 생성, 버전 관리 대상 아님)
+Debug/
+Release/
+
+# IDE 워크스페이스 설정 (개인 환경 파일)
+*.code-workspace
+
+# CubeMX Generate 직전 자동/수동 백업 (프로젝트 폴더 안에 생기면 빌드 충돌 유발)
+*_backup_*/
+Backup/
+*.bak
