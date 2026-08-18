@@ -5,6 +5,10 @@ Release/
 # IDE 워크스페이스 설정 (개인 환경 파일)
 *.code-workspace
 
+# 다른 툴체인용 생성 폴더 (이 프로젝트는 STM32CubeIDE만 사용)
+EWARM/
+MDK-ARM/
+
 # CubeMX Generate 직전 자동/수동 백업 (프로젝트 폴더 안에 생기면 빌드 충돌 유발)
 *_backup_*/
 Backup/
