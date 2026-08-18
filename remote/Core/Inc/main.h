@@ -36,7 +36,15 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
-
+/* CAN 수신 프레임 1개를 담는 구조체
+   (수신 인터럽트가 채워 넣고, CanRxTask 가 꺼내서 화면에 출력한다) */
+typedef struct
+{
+  uint32_t Id;       /* 프레임 식별자(ID) */
+  uint8_t  IsExt;    /* 0 = 표준 11비트 ID, 1 = 확장 29비트 ID */
+  uint8_t  Dlc;      /* 데이터 길이 (0~8 바이트) */
+  uint8_t  Data[8];  /* 페이로드 8바이트 */
+} CanRxFrame_t;
 /* USER CODE END ET */
 
 /* Exported constants --------------------------------------------------------*/
@@ -53,7 +61,15 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+/* CAN 원형 버퍼에서 프레임을 하나 꺼낸다.
+   반환값 1 = 하나 꺼냈음, 0 = 버퍼가 비어 있음 */
+uint8_t  CanRx_Pop(CanRxFrame_t *out);
 
+/* 부팅 후 지금까지 받은 CAN 프레임 총 개수 */
+uint32_t CanRx_GetTotal(void);
+
+/* 원형 버퍼가 가득 차서 버려진 프레임 개수 */
+uint32_t CanRx_GetOverflow(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
