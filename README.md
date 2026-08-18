@@ -369,12 +369,12 @@ AUTOSAR(차량용 소프트웨어 표준 구조)의 계층 개념을 참고해 *
 저장소는 CAN 버스로 연결된 두 노드를 각각의 폴더로 나눠 담습니다. 두 폴더는 서로 독립된 STM32CubeIDE 프로젝트이며, 공용 문서만 최상위에 둡니다.
 
 ```
-Project03_Self-driving Car/
+Project03_SelfDrivingCar/
 ├── README.md                     # 시스템 전체 문서 (CAN 프로토콜·노드 구성)
 ├── remote/                       # 조종 노드 — MPU-9250 자이로, 자세값 송신
 │   ├── Core/                     #   CubeMX 생성 HAL 초기화, freertos.c, main.c
 │   ├── Drivers/ Middlewares/
-│   └── Project03_GyroNode.ioc
+│   └── Project03_Remote.ioc
 └── vehicle/                      # 차량 노드 — 자율주행·수동주행·모터 구동
     ├── ASW/                      # 응용 소프트웨어 (주행 정책·판단)
     │   ├── Inc, Src
@@ -397,7 +397,7 @@ Project03_Self-driving Car/
     │   └── Startup                   # 스타트업 어셈블리
     ├── Drivers/                      # CMSIS + STM32F1xx HAL (표준 라이브러리)
     ├── Middlewares/                  # FreeRTOS (CMSIS-RTOS v1)
-    ├── Project03_Self-driving_Car.ioc  # CubeMX 설정 파일
+    ├── Project03_Vehicle.ioc         # CubeMX 설정 파일
     └── STM32F103C8TX_FLASH.ld        # 링커 스크립트
 ```
 
@@ -608,4 +608,4 @@ make -j
 
 **디버그 관찰** — 별도 디버그 UART가 없으므로([14. 한계](#14-한계-및-차기-프로젝트-반영) 1번 참고), 주행 중 내부 변수는 STM32CubeIDE의 **Live Expressions** 창에서 관찰합니다. 주요 관찰 대상은 `mcal_bt_serial.c`의 수신 카운터(`s_rxCount` / `s_errCount`)와 자율주행 FSM의 현재 상태·필터 거리값입니다.
 
-빌드 산출물 : `Debug/Project03_Self-driving Car.elf`, `.map`, `.list`
+빌드 산출물 : `Debug/Project03_Vehicle.elf`, `.map`, `.list`
