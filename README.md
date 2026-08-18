@@ -366,32 +366,42 @@ AUTOSAR(차량용 소프트웨어 표준 구조)의 계층 개념을 참고해 *
 | BSW / ECU_Abs | `ECU_<Module>_<Verb><Object>()` | `ECU_HCSR04_...` |
 | BSW / MCAL | `MCAL_<Module>_<Verb><Object>()` | `MCAL_CAN_Transmit()` |
 
+저장소는 CAN 버스로 연결된 두 노드를 각각의 폴더로 나눠 담습니다. 두 폴더는 서로 독립된 STM32CubeIDE 프로젝트이며, 공용 문서만 최상위에 둡니다.
+
 ```
 Project03_Self-driving Car/
-├── ASW/                          # 응용 소프트웨어 (주행 정책·판단)
-│   ├── Inc, Src
-│   │   ├── asw_autonomous        # 자율주행 4-state FSM, PD 센터링, 방향 투표
-│   │   └── asw_manual_control    # 수동주행, CAN/BT 명령 처리, 모드 전환, 타임아웃
-├── RTE/                          # 런타임 환경 (계층 간 인터페이스)
-│   ├── Inc, Src
-│   │   ├── rte_motor             # 주행 명령 추상화 (전진/후진/선회/정지)
-│   │   ├── rte_sensor            # 초음파 트리거·거리값 제공
-│   │   └── rte_mode_manager      # 주행모드 전역 상태 (Mutex 보호)
-├── BSW/                          # 기반 소프트웨어
-│   ├── ECU_Abs/Inc, Src
-│   │   ├── ecu_l298n             # L298N 모터드라이버 (PWM duty + 방향 핀)
-│   │   └── ecu_hcsr04            # HC-SR04 초음파 (Input Capture 펄스폭 → cm)
-│   └── MCAL/Inc, Src
-│       ├── mcal_can              # CAN 송수신, Mail Queue 브릿지, ISR 핸들러
-│       └── mcal_bt_serial        # HC-06 UART 인터럽트 수신, 오버런 복구
-├── Core/
-│   ├── Inc, Src                  # CubeMX 생성 HAL 초기화, freertos.c, main.c
-│   └── Startup                   # 스타트업 어셈블리
-├── Drivers/                      # CMSIS + STM32F1xx HAL (표준 라이브러리)
-├── Middlewares/                  # FreeRTOS (CMSIS-RTOS v1)
-├── Project03_Self-driving_Car.ioc  # CubeMX 설정 파일
-└── STM32F103C8TX_FLASH.ld        # 링커 스크립트
+├── README.md                     # 시스템 전체 문서 (CAN 프로토콜·노드 구성)
+├── remote/                       # 조종 노드 — MPU-9250 자이로, 자세값 송신
+│   ├── Core/                     #   CubeMX 생성 HAL 초기화, freertos.c, main.c
+│   ├── Drivers/ Middlewares/
+│   └── Project03_GyroNode.ioc
+└── vehicle/                      # 차량 노드 — 자율주행·수동주행·모터 구동
+    ├── ASW/                      # 응용 소프트웨어 (주행 정책·판단)
+    │   ├── Inc, Src
+    │   │   ├── asw_autonomous        # 자율주행 4-state FSM, PD 센터링, 방향 투표
+    │   │   └── asw_manual_control    # 수동주행, CAN/BT 명령 처리, 모드 전환, 타임아웃
+    ├── RTE/                      # 런타임 환경 (계층 간 인터페이스)
+    │   ├── Inc, Src
+    │   │   ├── rte_motor             # 주행 명령 추상화 (전진/후진/선회/정지)
+    │   │   ├── rte_sensor            # 초음파 트리거·거리값 제공
+    │   │   └── rte_mode_manager      # 주행모드 전역 상태 (Mutex 보호)
+    ├── BSW/                      # 기반 소프트웨어
+    │   ├── ECU_Abs/Inc, Src
+    │   │   ├── ecu_l298n             # L298N 모터드라이버 (PWM duty + 방향 핀)
+    │   │   └── ecu_hcsr04            # HC-SR04 초음파 (Input Capture 펄스폭 → cm)
+    │   └── MCAL/Inc, Src
+    │       ├── mcal_can              # CAN 송수신, Mail Queue 브릿지, ISR 핸들러
+    │       └── mcal_bt_serial        # HC-06 UART 인터럽트 수신, 오버런 복구
+    ├── Core/
+    │   ├── Inc, Src                  # CubeMX 생성 HAL 초기화, freertos.c, main.c
+    │   └── Startup                   # 스타트업 어셈블리
+    ├── Drivers/                      # CMSIS + STM32F1xx HAL (표준 라이브러리)
+    ├── Middlewares/                  # FreeRTOS (CMSIS-RTOS v1)
+    ├── Project03_Self-driving_Car.ioc  # CubeMX 설정 파일
+    └── STM32F103C8TX_FLASH.ld        # 링커 스크립트
 ```
+
+위 4계층 구조(ASW/RTE/BSW/Core) 설명은 `vehicle/` 노드에 해당합니다. `remote/` 노드는 자이로 읽기와 CAN 송신만 담당해 구조가 단순하며, 코드 작성이 진행되면 같은 계층 규칙을 따라 정리할 예정입니다.
 
 <br>
 
