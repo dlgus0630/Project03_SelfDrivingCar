@@ -163,9 +163,19 @@ void StartDefaultTask(void const * argument)
     {
       found_count++;
 
+      /* 디버거(Live Expressions)로 볼 진단 변수에도 같은 내용을 담아 둔다.
+         주소 목록 배열은 8칸뿐이므로, 그 안에 들어갈 때만 기록한다(경계 검사).
+         9개째부터는 개수만 늘어나고 목록에는 담기지 않는다. */
+      if (found_count <= 8u)
+      {
+        g_diag_i2c_addr[found_count - 1u] = addr;
+      }
+      g_diag_i2c_found = found_count;
+
       if (addr == MPU_ADDR_7BIT)
       {
         mpu_found = 1u;
+        g_diag_imu_addr = MPU_ADDR_7BIT;   /* IMU 를 이 주소에서 찾았다 */
         printf("[I2C]   0x%02X 응답  <- 9축 IMU 로 보입니다\r\n", (unsigned int)addr);
       }
       else if (addr == BMP280_ADDR_7BIT)
@@ -200,19 +210,38 @@ void StartDefaultTask(void const * argument)
                          MPU_REG_WHO_AM_I, I2C_MEMADD_SIZE_8BIT,
                          &who_am_i, 1, 100) == HAL_OK)
     {
+      /* 읽은 값 그대로를 디버거로 볼 수 있게 남긴다 */
+      g_diag_who_am_i = who_am_i;
+
+      /* 화면에 찍을 이름과, 디버거로 볼 판별 코드를 함께 정한다.
+         (판별 코드의 의미는 main.h / main.c 의 선언부에 적어 두었다) */
       switch (who_am_i)
       {
-        case 0x71u: chip_name = "MPU-9250 (9축, 나침반 있음)";  break;
-        case 0x73u: chip_name = "MPU-9255 (9축, 나침반 있음)";  break;
-        case 0x70u: chip_name = "MPU-6500 (6축, 나침반 없음)";  break;
-        case 0x68u: chip_name = "MPU-6050 (6축, 나침반 없음)";  break;
-        default:    chip_name = "알 수 없는 칩";                 break;
+        case 0x71u: chip_name = "MPU-9250 (9축, 나침반 있음)";
+                    g_diag_imu_kind = 1u;   /* 1 = MPU-9250 */
+                    break;
+        case 0x73u: chip_name = "MPU-9255 (9축, 나침반 있음)";
+                    g_diag_imu_kind = 2u;   /* 2 = MPU-9255 */
+                    break;
+        case 0x70u: chip_name = "MPU-6500 (6축, 나침반 없음)";
+                    g_diag_imu_kind = 3u;   /* 3 = MPU-6500 */
+                    break;
+        case 0x68u: chip_name = "MPU-6050 (6축, 나침반 없음)";
+                    g_diag_imu_kind = 4u;   /* 4 = MPU-6050 */
+                    break;
+        default:    chip_name = "알 수 없는 칩";
+                    g_diag_imu_kind = 9u;   /* 9 = 알 수 없는 칩 */
+                    break;
       }
       printf("[IMU] WHO_AM_I(0x75) = 0x%02X -> %s\r\n",
              (unsigned int)who_am_i, chip_name);
     }
     else
     {
+      /* 읽기에 실패했다는 사실 자체를 디버거로 구분할 수 있게 표시한다.
+         0xFF 는 "읽지 못했다"는 뜻으로 쓰는 값이다. */
+      g_diag_who_am_i = 0xFFu;
+      g_diag_imu_kind = 0u;   /* 0 = 못 찾음 */
       printf("[IMU] 0x68 은 응답했지만 WHO_AM_I 레지스터를 읽지 못했습니다\r\n");
     }
   }
@@ -220,6 +249,11 @@ void StartDefaultTask(void const * argument)
   {
     printf("[IMU] 0x68 주소에서 응답이 없습니다. AD0 핀이 3.3V 라면 주소는 0x69 입니다\r\n");
   }
+
+  /* 여기까지 왔다면 I2C 스캔과 칩 판별이 모두 끝난 것이다.
+     디버거에서 이 값이 1 이 되어야 위의 진단 변수들을 믿고 읽을 수 있다.
+     계속 0 이라면 스캔 도중에 멈춰 있다는 뜻이다. */
+  g_diag_scan_done = 1u;
 
   printf("----------------------------------------\r\n");
   printf("[알림] 이제부터 1초마다 CAN 수신 현황을 알려드립니다\r\n");
@@ -231,6 +265,11 @@ void StartDefaultTask(void const * argument)
     osDelay(1000);
 
     total = CanRx_GetTotal();
+
+    /* 직전 1초 동안 늘어난 개수를 디버거로 볼 수 있게 담아 둔다.
+       이 값이 0 이면 상대 노드가 안 보내고 있거나 배선 문제이고,
+       정상이라면 상대가 100ms 주기로 보내므로 10 안팎이 나와야 한다. */
+    g_diag_can_per_sec = total - prev_total;
 
     /* 총 개수와, 직전 1초 동안 늘어난 개수를 같이 보여준다.
        늘어난 개수가 0 이면 상대 노드가 안 보내고 있거나 배선 문제다.

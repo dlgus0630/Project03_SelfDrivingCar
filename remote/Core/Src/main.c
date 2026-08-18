@@ -62,6 +62,49 @@ static volatile uint16_t     g_can_head     = 0;  /* 인터럽트가 다음에 �
 static volatile uint16_t     g_can_tail     = 0;  /* 태스크가 다음에 읽을 칸 */
 static volatile uint32_t     g_can_total    = 0;  /* 총 수신 개수 */
 static volatile uint32_t     g_can_overflow = 0;  /* 버퍼가 꽉 차서 버린 개수 */
+
+/* ===== 디버거 관찰용 진단 변수 (Live Expressions) =====
+   USB-TTL 시리얼 어댑터가 없어 printf 출력을 볼 수 없을 때,
+   STM32CubeIDE 의 Live Expressions 창(디버깅 중에 변수 값을 실시간으로 보는 기능)에
+   아래 이름을 그대로 적어 넣으면 값이 보인다.
+
+   주의 1) static 을 붙이지 않는다.
+             static 은 "이 파일 안에서만 보이게 하라"는 뜻이라,
+             디버거가 이름으로 변수를 못 찾는 경우가 생긴다.
+   주의 2) volatile 은 반드시 붙인다.
+             이것이 없으면 컴파일러가 "어차피 아무도 안 읽는 값"이라고 판단해
+             대입 문장 자체를 지워버리거나 레지스터에만 담아두어
+             메모리를 들여다보는 디버거에게는 엉뚱한 값이 보인다. */
+
+/* I2C 스캔에서 응답한 장치 총 개수 */
+volatile uint8_t  g_diag_i2c_found        = 0u;
+/* 응답한 주소 목록 (최대 8개까지, 나머지 칸은 0) */
+volatile uint8_t  g_diag_i2c_addr[8]      = {0u};
+/* IMU 주소. 0x68 이 응답하면 0x68, 못 찾으면 0 */
+volatile uint8_t  g_diag_imu_addr         = 0u;
+/* WHO_AM_I(0x75) 레지스터에서 읽은 값. 못 읽으면 0xFF */
+volatile uint8_t  g_diag_who_am_i         = 0xFFu;
+/* 칩이 어떤 모델인지 판별한 결과 코드
+     0 = 못 찾음
+     1 = MPU-9250 (WHO_AM_I 값 0x71, 9축·나침반 있음)
+     2 = MPU-9255 (WHO_AM_I 값 0x73, 9축·나침반 있음)
+     3 = MPU-6500 (WHO_AM_I 값 0x70, 6축·나침반 없음)
+     4 = MPU-6050 (WHO_AM_I 값 0x68, 6축·나침반 없음)
+     9 = 알 수 없는 칩 */
+volatile uint8_t  g_diag_imu_kind         = 0u;
+/* I2C 스캔이 끝나면 1 이 된다 */
+volatile uint8_t  g_diag_scan_done        = 0u;
+
+/* CAN 총 수신 개수 */
+volatile uint32_t g_diag_can_total        = 0u;
+/* 마지막으로 받은 프레임의 ID */
+volatile uint32_t g_diag_can_last_id      = 0u;
+/* 마지막으로 받은 프레임의 데이터 길이 (0~8) */
+volatile uint8_t  g_diag_can_last_dlc     = 0u;
+/* 마지막으로 받은 프레임의 데이터 8바이트 */
+volatile uint8_t  g_diag_can_last_data[8] = {0u};
+/* 직전 1초 동안 받은 개수 */
+volatile uint32_t g_diag_can_per_sec      = 0u;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -260,6 +303,18 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan_arg)
 
   /* 총 수신 개수는 버퍼가 꽉 찼든 아니든 항상 센다 */
   g_can_total++;
+
+  /* 디버거(Live Expressions)로 볼 진단용 값도 여기서 같이 갱신한다.
+     인터럽트 안이므로 printf 는 절대 부르지 않고 단순 대입만 한다.
+     아래는 원형 버퍼가 가득 차서 버리는 경우보다 앞에 두었다.
+     버려지더라도 "버스에 지금 무엇이 흘러오는가"는 보여야 하기 때문이다. */
+  g_diag_can_total    = g_can_total;
+  g_diag_can_last_id  = (header.IDE == CAN_ID_STD) ? header.StdId : header.ExtId;
+  g_diag_can_last_dlc = (uint8_t)header.DLC;
+  for (i = 0u; i < 8u; i++)
+  {
+    g_diag_can_last_data[i] = rx_data[i];
+  }
 
   head = g_can_head;
   next = (uint16_t)(head + 1u);
