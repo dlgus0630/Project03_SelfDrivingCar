@@ -3,8 +3,8 @@
  *
  *  Layer  : BSW / MCAL (통신 / OS 인터페이스)
  *  Module : MCAL_CAN
- *  Desc   : 3-Node 공유 CAN 버스(Node1 NUCLEO, Node2 STM32(본 노드),
- *           Node3 RaspberryPi) 송수신을 RTOS Mail Queue로 브릿지하는 래퍼.
+ *  Desc   : 2-Node 공유 CAN 버스(Node1 NUCLEO 마스터, Node2 STM32(본 노드))
+ *           송수신을 RTOS Mail Queue로 브릿지하는 래퍼.
  *           CAN ISR(HAL_CAN_RxFifo0MsgPendingCallback)에서는 최소한의
  *           작업(Read + MailPut)만 수행하고, 실제 처리는 CanRxTask에서
  *           담당한다.
@@ -27,13 +27,12 @@
  * CAN ID 정의 (Communication Matrix 확정본)
  *   0x100 ~ 0x1FF : Node1 (NUCLEO, Master)     -> 전체 Broadcast
  *   0x200 ~ 0x2FF : Node2 (STM32, 본 슬레이브) -> 상태/응답
- *   0x300 ~ 0x3FF : Node3 (Raspberry Pi)       -> 고수준 AI 판단 명령
+ *   0x3F0         : Node2 전용 생존 신호(Heartbeat) 송신 ID
  * ------------------------------------------------------------------------ */
 #define MCAL_CAN_ID_MASTER_MODE_CMD      0x100u  /* 수동/자동 모드 전환 */
 #define MCAL_CAN_ID_MASTER_MANUAL_CMD    0x110u  /* 수동 조향/속도 명령 */
 #define MCAL_CAN_ID_SLAVE_STATUS         0x200u  /* 슬레이브 상태/거리값 응답 */
-#define MCAL_CAN_ID_RPI_AI_CMD           0x300u  /* AI 판단 고수준 명령 */
-#define MCAL_CAN_ID_SLAVE_HEARTBEAT      0x3F0u  /* 생존 신호 */
+#define MCAL_CAN_ID_SLAVE_HEARTBEAT      0x3F0u  /* 본 노드 생존 신호 */
 
 #define MCAL_CAN_RX_QUEUE_LEN            8u
 #define MCAL_CAN_DLC_MAX                 8u

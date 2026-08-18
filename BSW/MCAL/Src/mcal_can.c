@@ -41,10 +41,11 @@ void MCAL_CAN_Init(void)
 
 /* ------------------------------------------------------------------------
  * MCAL_CAN_ConfigFilter
- *   Node2가 수신할 ID 대역: 0x100~0x1FF(Master), 0x300~0x3FF(RPi)
- *   Mask: 0x700 (Bit 10:8 검사) -> StdId[10:8] 패턴이 001 또는 011 인 것만 통과.
- *   ※ Mask Mode 특성상 완전히 임의의 두 구간을 한 필터로 정확히 분리할 수
- *     없으므로, FilterBank 0(Master 대역), FilterBank 1(RPi 대역) 2개로 분리.
+ *   Node2가 수신할 ID 대역: 0x100~0x1FF(Master)
+ *   Mask: 0x700 (Bit 10:8 검사) -> StdId[10:8] 패턴이 001 인 것만 통과.
+ *   ※ 2-Node 구성이므로 본 노드가 수신할 대역은 마스터 대역 하나뿐이며,
+ *     FilterBank 0 한 개만 사용한다. (0x200/0x3F0은 본 노드가 송신하는
+ *     ID이므로 수신 필터에 등록하지 않는다.)
  * ------------------------------------------------------------------------ */
 void MCAL_CAN_ConfigFilter(void)
 {
@@ -59,15 +60,6 @@ void MCAL_CAN_ConfigFilter(void)
     s_canFilterConfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
     s_canFilterConfig.FilterActivation     = ENABLE;
     s_canFilterConfig.SlaveStartFilterBank = 14;
-    if (HAL_CAN_ConfigFilter(&hcan, &s_canFilterConfig) != HAL_OK)
-    {
-        Error_Handler();
-    }
-
-    /* FilterBank 1 : 0x300 ~ 0x3FF (RPi 대역) */
-    s_canFilterConfig.FilterBank       = 1;
-    s_canFilterConfig.FilterIdHigh     = (0x300u << 5);
-    s_canFilterConfig.FilterMaskIdHigh = (0x700u << 5);
     if (HAL_CAN_ConfigFilter(&hcan, &s_canFilterConfig) != HAL_OK)
     {
         Error_Handler();
