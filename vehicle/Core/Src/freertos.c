@@ -288,13 +288,82 @@ void StartCanRxTask(void const * argument)
 void StartCanTxTask(void const * argument)
 {
   /* USER CODE BEGIN StartCanTxTask */
+  /* 버스오프 복구 재시도 간격을 제한하기 위한 주기 카운터.
+   * 이 태스크는 100ms 주기이므로 10주기 = 약 1초에 한 번만 복구를 시도한다.
+   *
+   * 간격을 두는 이유:
+   *  1) HAL_CAN_Stop()은 CAN을 초기화 모드로 넣으면서 대기 중이던 송신
+   *     메일박스를 전부 취소해 버린다. 100ms마다 Stop/Start를 반복하면
+   *     정상 복구된 뒤에도 송신이 계속 끊겨 오히려 통신이 더 나빠진다.
+   *  2) CAN 규격상 버스오프에서 빠져나오려면 "연속 11비트 리세시브"를
+   *     128번 관측해야 한다. 상대 노드가 아직 안 켜져 있으면 복구 직후
+   *     곧바로 다시 버스오프로 떨어지므로, 무한정 재시도해봐야 소용없다.
+   *     1초 간격이면 상대 노드가 살아나는 즉시 늦어도 1초 안에 다시 붙는다.
+   *  3) 복구 시도 횟수가 1초에 1씩만 늘어나므로, Live Expressions에서
+   *     g_vdiag_can_recover_cnt 값을 "버스오프였던 시간(초)"으로 바로
+   *     읽을 수 있다. */
+  uint32_t busOffRetryTick = 0u;
+
   for(;;)
   {
+    uint32_t esr;
+
     McalCanSlaveState_t state = (RTE_Mode_GetDriveMode() == RTE_DRIVE_MODE_AUTO)
                                ? MCAL_CAN_STATE_AUTO
                                : MCAL_CAN_STATE_MANUAL;
 
     MCAL_CAN_BroadcastSlaveStatus(state, g_dist_left, g_dist_front, g_dist_right);
+
+    /* ---- [진단] CAN 오류상태 레지스터(ESR) 주기 갱신 ----
+     * 비트 배치는 RM0008(STM32F1 참조매뉴얼) 기준이며, 아래 CAN_ESR_*_Pos /
+     * CAN_ESR_*_Msk 매크로는 CMSIS 헤더(stm32f103xb.h)가 제공하는 공식 값이다.
+     *   REC = 31:24 / TEC = 23:16 / LEC = 6:4 / BOFF = 비트2 / EPVF = 비트1 /
+     *   EWGF = 비트0
+     * ESR은 읽기 전용 상태 레지스터이므로 여기서 읽어도 통신에 영향이 없다. */
+    esr = hcan.Instance->ESR;
+
+    g_vdiag_can_esr_raw = esr;
+    g_vdiag_can_rec  = (uint8_t)((esr & CAN_ESR_REC_Msk) >> CAN_ESR_REC_Pos);
+    g_vdiag_can_tec  = (uint8_t)((esr & CAN_ESR_TEC_Msk) >> CAN_ESR_TEC_Pos);
+    g_vdiag_can_lec  = (uint8_t)((esr & CAN_ESR_LEC_Msk) >> CAN_ESR_LEC_Pos);
+    g_vdiag_can_boff = (uint8_t)(((esr & CAN_ESR_BOFF) != 0u) ? 1u : 0u);
+    g_vdiag_can_epvf = (uint8_t)(((esr & CAN_ESR_EPVF) != 0u) ? 1u : 0u);
+    g_vdiag_can_ewgf = (uint8_t)(((esr & CAN_ESR_EWGF) != 0u) ? 1u : 0u);
+
+    /* ---- 버스오프 자동 복구 (진단용 임시 코드가 아니라 정식 기능) ----
+     * 이 보드는 CubeMX 설정에서 AutoBusOff가 DISABLE(꺼짐)로 되어 있다.
+     * AutoBusOff가 켜져 있으면 버스오프에 빠졌을 때 하드웨어가 알아서
+     * 복구 절차를 밟지만, 꺼져 있으면 CAN 컨트롤러는 버스오프 상태에
+     * 그대로 눌러앉아 영원히 한 프레임도 내보내지 않는다.
+     * 즉 상대 노드가 꺼져 있는 동안 혼자 송신하다 한 번 버스오프로
+     * 떨어지면, 나중에 상대 노드를 켜도 이쪽은 영영 조용한 채로 남는다.
+     * 그래서 소프트웨어가 버스오프를 직접 감지해 CAN을 껐다 켜서
+     * 되살려 주어야 한다. (.ioc 설정은 건드리지 않는 것이 요구사항이므로
+     * 이 소프트웨어 복구 로직을 정식으로 남겨 둔다.) */
+    if (g_vdiag_can_boff != 0u)
+    {
+      if (busOffRetryTick == 0u)
+      {
+        g_vdiag_can_recover_cnt++;   /* 복구 시도 횟수 기록 */
+
+        /* Stop -> Start 로 CAN 셀을 초기화 모드에 넣었다 빼면서
+         * 버스오프 복구 시퀀스를 다시 시작시킨다. */
+        (void)HAL_CAN_Stop(&hcan);
+        (void)HAL_CAN_Start(&hcan);
+      }
+
+      busOffRetryTick++;
+      if (busOffRetryTick >= 10u)   /* 100ms * 10 = 약 1초마다 재시도 */
+      {
+        busOffRetryTick = 0u;
+      }
+    }
+    else
+    {
+      /* 정상 상태로 돌아왔으면 다음 버스오프 때 곧바로 복구할 수 있도록
+       * 재시도 카운터를 초기화해 둔다. */
+      busOffRetryTick = 0u;
+    }
 
     osDelay(100);
   }

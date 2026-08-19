@@ -62,6 +62,46 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+/* ==========================================================================
+ * CAN 버스 진단용 전역 변수 (STM32CubeIDE의 Live Expressions 창 관찰 전용)
+ *
+ * 이 보드에는 USB-TTL 어댑터가 없어 printf 로그를 눈으로 볼 수 없다. 그래서
+ * 디버거의 Live Expressions 창에서 값을 직접 들여다볼 수 있도록, 파일 스코프
+ * static이 아니라 "static 없는 volatile 전역"으로 선언한다.
+ *   - static을 붙이면 심볼이 파일 내부에 숨어 디버거가 못 찾는 경우가 있다.
+ *   - volatile을 붙여야 컴파일러가 값을 레지스터에만 담아두지 않고 매번 RAM에
+ *     써주므로, 디버거가 읽는 값이 항상 최신값이 된다.
+ *
+ * 값의 출처는 CAN 오류상태 레지스터(CAN_ESR)이며, 비트 배치는 RM0008
+ * (STM32F1 참조매뉴얼) 기준이다.
+ *   REC  = 비트 31:24 (수신 오류 카운터)
+ *   TEC  = 비트 23:16 (송신 오류 카운터)
+ *   LEC  = 비트  6:4  (마지막 오류 코드)
+ *   BOFF = 비트 2     (버스오프 상태)
+ *   EPVF = 비트 1     (오류 수동 상태)
+ *   EWGF = 비트 0     (오류 경고 상태)
+ *
+ * LEC(마지막 오류 코드) 값 의미표
+ *   0 : 오류 없음
+ *   1 : 스터프 오류
+ *   2 : 폼 오류
+ *   3 : ACK 오류   <-- 응답(ACK)해 주는 노드가 버스에 하나도 없다는 뜻
+ *   4 : 비트 리세시브 오류
+ *   5 : 비트 도미넌트 오류
+ *   6 : CRC 오류
+ *   7 : 소프트웨어가 설정한 값
+ * ========================================================================== */
+volatile uint8_t  g_vdiag_can_tec         = 0u;  /* 송신 오류 카운터 (ESR 23:16) */
+volatile uint8_t  g_vdiag_can_rec         = 0u;  /* 수신 오류 카운터 (ESR 31:24) */
+volatile uint8_t  g_vdiag_can_lec         = 0u;  /* 마지막 오류 코드 0~7 (ESR 6:4) */
+volatile uint8_t  g_vdiag_can_boff        = 0u;  /* 버스오프 상태면 1 (ESR 비트2) */
+volatile uint8_t  g_vdiag_can_epvf        = 0u;  /* 오류 수동 상태면 1 (ESR 비트1) */
+volatile uint8_t  g_vdiag_can_ewgf        = 0u;  /* 오류 경고 상태면 1 (ESR 비트0) */
+volatile uint32_t g_vdiag_can_esr_raw     = 0u;  /* ESR 레지스터 원본값 */
+volatile uint32_t g_vdiag_can_tx_ok       = 0u;  /* 송신 요청 성공 누적 횟수 */
+volatile uint32_t g_vdiag_can_tx_fail     = 0u;  /* 송신 요청 실패 누적 횟수 */
+volatile uint32_t g_vdiag_can_free_mb     = 0u;  /* 비어 있는 송신 메일박스 수 (0~3) */
+volatile uint32_t g_vdiag_can_recover_cnt = 0u;  /* 버스오프 복구 시도 누적 횟수 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/

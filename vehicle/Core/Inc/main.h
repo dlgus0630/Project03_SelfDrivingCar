@@ -53,7 +53,20 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-
+/* CAN 진단용 전역 변수의 extern 선언 (실체는 main.c의 USER CODE PV 블록에 있음)
+ * mcal_can.c, freertos.c 등 다른 파일에서 이 변수들에 값을 채우기 위해 필요하다.
+ * 각 변수의 의미와 ESR 비트 배치 설명은 main.c 선언부 주석을 참고할 것. */
+extern volatile uint8_t  g_vdiag_can_tec;
+extern volatile uint8_t  g_vdiag_can_rec;
+extern volatile uint8_t  g_vdiag_can_lec;
+extern volatile uint8_t  g_vdiag_can_boff;
+extern volatile uint8_t  g_vdiag_can_epvf;
+extern volatile uint8_t  g_vdiag_can_ewgf;
+extern volatile uint32_t g_vdiag_can_esr_raw;
+extern volatile uint32_t g_vdiag_can_tx_ok;
+extern volatile uint32_t g_vdiag_can_tx_fail;
+extern volatile uint32_t g_vdiag_can_free_mb;
+extern volatile uint32_t g_vdiag_can_recover_cnt;
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

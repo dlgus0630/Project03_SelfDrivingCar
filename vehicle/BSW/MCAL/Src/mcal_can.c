@@ -73,6 +73,7 @@ osStatus MCAL_CAN_Transmit(uint32_t id, const uint8_t *p_data, uint8_t dlc)
 {
     CAN_TxHeaderTypeDef txHeader;
     uint32_t txMailbox;
+    uint32_t freeLevel;
 
     if (dlc > MCAL_CAN_DLC_MAX)
     {
@@ -84,15 +85,32 @@ osStatus MCAL_CAN_Transmit(uint32_t id, const uint8_t *p_data, uint8_t dlc)
     txHeader.RTR   = CAN_RTR_DATA;
     txHeader.DLC   = dlc;
 
-    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) == 0u)
+    /* [진단] 비어 있는 송신 메일박스 수(0~3)를 전역에 기록한다.
+     * 기존에도 호출하던 함수의 결과를 지역변수에 한 번만 담아 쓰는 것이므로
+     * 판정 조건과 동작은 기존과 완전히 동일하다.
+     * 이 값이 계속 0으로 붙어 있으면 메일박스 3개가 전부 "송신 대기"로 막혀
+     * 있다는 뜻이고, 곧 아무도 ACK를 주지 않아 프레임이 버스 밖으로 나가지
+     * 못하고 있다는 신호다. */
+    freeLevel = HAL_CAN_GetTxMailboxesFreeLevel(&hcan);
+    g_vdiag_can_free_mb = freeLevel;
+
+    if (freeLevel == 0u)
     {
+        /* [진단] 메일박스가 꽉 차서 송신 요청 자체를 넣지 못한 경우도
+         * "송신 요청 실패"로 함께 집계한다. 그래야 Live Expressions에서
+         * tx_ok가 멈춘 이유가 "태스크가 안 도는 것"인지 "메일박스가 막힌 것"
+         * 인지 구분된다. 반환값과 동작은 기존과 동일하다. */
+        g_vdiag_can_tx_fail++;
         return osErrorResource; /* 3개 Mailbox 모두 사용 중 (버스 혼잡) */
     }
 
     if (HAL_CAN_AddTxMessage(&hcan, &txHeader, (uint8_t *)p_data, &txMailbox) != HAL_OK)
     {
+        g_vdiag_can_tx_fail++;  /* [진단] 송신 요청 실패 */
         return osErrorOS;
     }
+
+    g_vdiag_can_tx_ok++;        /* [진단] 송신 요청(메일박스 적재) 성공 */
     return osOK;
 }
 
