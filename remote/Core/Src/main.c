@@ -105,6 +105,85 @@ volatile uint8_t  g_diag_can_last_dlc     = 0u;
 volatile uint8_t  g_diag_can_last_data[8] = {0u};
 /* 직전 1초 동안 받은 개수 */
 volatile uint32_t g_diag_can_per_sec      = 0u;
+
+/* ===== CAN 통신 장애 원인 판별용 진단 변수 =====
+   수신이 전혀 안 될 때(g_diag_can_per_sec 가 계속 0),
+   원인이 "MCU 안쪽 설정"인지 "바깥 배선·트랜시버·상대 노드"인지
+   갈라내기 위한 값들이다. 전부 Live Expressions 로 관찰한다.
+   앞의 진단 변수들과 같은 이유로 static 을 붙이지 않고 volatile 만 붙인다. */
+
+/* HAL_CAN_Start() 가 성공해서 지금 정상 모드로 돌고 있으면 1, 아니면 0 */
+volatile uint8_t  g_diag_can_started      = 0u;
+/* 수신 필터 설정(HAL_CAN_ConfigFilter)이 성공했으면 1 */
+volatile uint8_t  g_diag_can_filter_ok    = 0u;
+/* 수신 인터럽트 켜기(HAL_CAN_ActivateNotification)가 성공했으면 1 */
+volatile uint8_t  g_diag_can_notify_ok    = 0u;
+
+/* ===== CAN_ESR(오류 상태 레지스터)에서 뽑아낸 값들 =====
+   RM0008(STM32F1 참조매뉴얼)의 CAN_ESR 비트 배치는 다음과 같다.
+     비트 31~24 : REC[7:0]  수신 오류 카운터
+     비트 23~16 : TEC[7:0]  송신 오류 카운터
+     비트  6~4  : LEC[2:0]  마지막 오류 코드
+     비트  3    : (예약, 쓰지 않음)
+     비트  2    : BOFF      버스오프 상태
+     비트  1    : EPVF      오류 수동(Error Passive) 상태
+     비트  0    : EWGF      오류 경고(Error Warning) 상태
+   [확인 기록] 작업 지시서의 표에는 TEC 가 24~31비트, REC 가 16~23비트라고
+   적혀 있었으나 이는 둘이 서로 뒤바뀐 것이다. RM0008 기준으로는 위가 맞다.
+   그래서 값을 뽑아내는 코드도 TEC 는 16비트에서, REC 는 24비트에서
+   잘라내도록 해 두었다(freertos.c 의 Can_UpdateErrorDiag 참고). */
+
+/* 송신 오류 카운터 (ESR 비트 23~16).
+   보낸 프레임이 실패할 때마다 8씩 오른다.
+   아무도 응답(ACK)해 주지 않는 상황이면 순식간에 128 까지 치솟는다. */
+volatile uint8_t  g_diag_can_tec          = 0u;
+/* 수신 오류 카운터 (ESR 비트 31~24).
+   받는 쪽에서 어긋난 프레임을 볼 때마다 오른다.
+   상대가 아예 아무것도 안 보내면 이 값은 0 에서 그대로 멈춰 있다. */
+volatile uint8_t  g_diag_can_rec          = 0u;
+/* 마지막 오류 코드 (ESR 비트 6~4). 값의 뜻은 아래 표와 같다.
+     0 = 오류 없음
+     1 = 스터프 오류 (같은 값이 6비트 내리 나왔다.
+                      두 노드의 통신 속도(보율)가 서로 다를 때 잘 난다)
+     2 = 폼 오류     (프레임의 정해진 모양이 어긋났다)
+     3 = ACK 오류    (응답해 주는 노드가 하나도 없다.
+                      상대가 꺼져 있거나, 트랜시버·배선·종단저항 문제다)
+     4 = 비트 리세시브 오류 (1 을 내보냈는데 버스에서는 0 으로 읽혔다)
+     5 = 비트 도미넌트 오류 (0 을 내보냈는데 버스에서는 1 로 읽혔다.
+                             보통 트랜시버가 안 물려 있거나 배선이 끊긴 경우다)
+     6 = CRC 오류    (검사값이 어긋났다)
+     7 = 소프트웨어가 직접 써 넣은 값 (하드웨어가 낸 오류가 아니다) */
+volatile uint8_t  g_diag_can_lec          = 0u;
+/* 버스오프 상태면 1 (ESR 비트 2).
+   송신 오류가 255 를 넘어서 컨트롤러가 스스로 버스에서 빠져나간 상태다. */
+volatile uint8_t  g_diag_can_boff         = 0u;
+/* 오류 수동(Error Passive) 상태면 1 (ESR 비트 1) */
+volatile uint8_t  g_diag_can_epvf         = 0u;
+/* 오류 경고(Error Warning) 상태면 1 (ESR 비트 0) */
+volatile uint8_t  g_diag_can_ewgf         = 0u;
+/* ESR 레지스터를 가공하지 않은 원본값 그대로.
+   위의 낱개 값들이 미덥지 않을 때 이 값을 직접 들여다보면 된다. */
+volatile uint32_t g_diag_can_esr_raw      = 0u;
+/* HAL_CAN_GetError() 가 알려주는, HAL 계층이 모아 둔 오류값 */
+volatile uint32_t g_diag_can_hal_err      = 0u;
+
+/* ===== 루프백 자기진단 결과 =====
+   루프백은 트랜시버도 바깥 배선도 없이,
+   자기가 내보낸 프레임을 자기가 되받아 보는 시험 모드다.
+   여기서 성공(1)이 나오면 클럭·비트타이밍(통신 속도)·필터·인터럽트 같은
+   MCU 안쪽 설정이 전부 정상이라는 뜻이고,
+   남은 원인은 바깥(트랜시버·배선·종단저항·상대 노드)뿐으로 좁혀진다.
+     0 = 아직 실행 안 함
+     1 = 성공 (MCU 안쪽은 정상)
+     2 = 송신 실패 (송신함에 프레임을 넣지 못했다)
+     3 = 수신 타임아웃 (내보냈지만 100ms 안에 되돌아오지 않았다)
+     4 = 데이터 불일치 (되돌아오긴 했지만 보낸 내용과 다르다) */
+volatile uint8_t  g_diag_can_loopback     = 0u;
+/* 루프백 시험을 마치고 정상 모드로 되돌리는 데 성공했으면 1.
+   이 값이 0 이면 이후 통신이 영영 안 되는 상태이므로 가장 먼저 확인해야 한다. */
+volatile uint8_t  g_diag_can_restore_ok   = 0u;
+/* 버스오프를 감지해 소프트웨어로 복구를 시도한 횟수 */
+volatile uint32_t g_diag_can_recover_cnt  = 0u;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -191,9 +270,17 @@ int main(void)
   {
     printf("[CAN] 필터 설정 실패 (그래도 계속 진행합니다)\r\n");
   }
+  else
+  {
+    g_diag_can_filter_ok = 1u;   /* 디버거에서 볼 수 있게 성공 여부를 남긴다 */
+  }
   if (HAL_CAN_Start(&hcan) != HAL_OK)
   {
     printf("[CAN] 시작 실패 - 트랜시버 연결과 배선을 확인하세요 (그래도 계속 진행합니다)\r\n");
+  }
+  else
+  {
+    g_diag_can_started = 1u;
   }
   if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
   {
@@ -201,6 +288,7 @@ int main(void)
   }
   else
   {
+    g_diag_can_notify_ok = 1u;
     printf("[CAN] 준비 완료 - 모든 ID 를 통과시키는 필터로 대기합니다\r\n");
   }
   /* USER CODE END 2 */

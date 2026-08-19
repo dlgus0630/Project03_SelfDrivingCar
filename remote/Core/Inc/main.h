@@ -86,6 +86,23 @@ extern volatile uint32_t g_diag_can_last_id;      /* 마지막 프레임 ID */
 extern volatile uint8_t  g_diag_can_last_dlc;     /* 마지막 프레임 데이터 길이 */
 extern volatile uint8_t  g_diag_can_last_data[8]; /* 마지막 프레임 데이터 8바이트 */
 extern volatile uint32_t g_diag_can_per_sec;      /* 직전 1초 동안 받은 개수 */
+
+/* ===== CAN 장애 원인 판별용 진단 변수 (실체는 main.c 에 있다) =====
+   각 값의 자세한 뜻과 코드값 표는 main.c 의 선언부에 적어 두었다. */
+extern volatile uint8_t  g_diag_can_started;     /* CAN 시작 성공 시 1 */
+extern volatile uint8_t  g_diag_can_filter_ok;   /* 수신 필터 설정 성공 시 1 */
+extern volatile uint8_t  g_diag_can_notify_ok;   /* 수신 인터럽트 켜기 성공 시 1 */
+extern volatile uint8_t  g_diag_can_tec;         /* 송신 오류 카운터 (ESR 23~16비트) */
+extern volatile uint8_t  g_diag_can_rec;         /* 수신 오류 카운터 (ESR 31~24비트) */
+extern volatile uint8_t  g_diag_can_lec;         /* 마지막 오류 코드 (ESR 6~4비트) */
+extern volatile uint8_t  g_diag_can_boff;        /* 버스오프 상태면 1 */
+extern volatile uint8_t  g_diag_can_epvf;        /* 오류 수동 상태면 1 */
+extern volatile uint8_t  g_diag_can_ewgf;        /* 오류 경고 상태면 1 */
+extern volatile uint32_t g_diag_can_esr_raw;     /* ESR 레지스터 원본값 */
+extern volatile uint32_t g_diag_can_hal_err;     /* HAL_CAN_GetError() 반환값 */
+extern volatile uint8_t  g_diag_can_loopback;    /* 루프백 결과 (0/1/2/3/4) */
+extern volatile uint8_t  g_diag_can_restore_ok;  /* 정상 모드 복귀 성공 시 1 */
+extern volatile uint32_t g_diag_can_recover_cnt; /* 버스오프 복구 시도 횟수 */
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

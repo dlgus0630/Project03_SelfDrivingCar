@@ -27,6 +27,8 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include "i2c.h"
+/* CAN 손잡이(hcan)와 CAN 관련 HAL 함수들을 쓰기 위해 필요하다 */
+#include "can.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -67,7 +69,17 @@ osThreadId CanRxTaskHandle;
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
+/* 모든 ID 를 통과시키는 수신 필터를 설정한다.
+   루프백 시험 전과 정상 모드 복귀 때 두 번 쓰이므로 함수로 묶어 두었다.
+   반환값 1 = 성공, 0 = 실패 */
+static uint8_t Can_SetAcceptAllFilter(void);
 
+/* CAN 컨트롤러 자체가 멀쩡한지 바깥 배선과 무관하게 확인하는 자기진단.
+   결과는 g_diag_can_loopback 과 g_diag_can_restore_ok 에 담긴다. */
+static void Can_LoopbackSelfTest(void);
+
+/* CAN_ESR(오류 상태 레지스터)를 읽어 진단 변수들을 갱신한다. */
+static void Can_UpdateErrorDiag(void);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void const * argument);
@@ -149,6 +161,17 @@ void StartDefaultTask(void const * argument)
   const char  *chip_name;
   uint32_t     total;
   uint32_t     prev_total  = 0u;   /* 1초 전의 총 수신 개수 */
+
+  /* ================= CAN 루프백 자기진단 (부팅 후 딱 한 번만) =================
+     [왜 여기인가]
+       1) 이 자리는 FreeRTOS 스케줄러가 이미 돌기 시작한 뒤라서
+          osDelay() 를 쓸 수 있다. main() 안이었다면 스케줄러가 아직 안 돌아
+          osDelay() 가 먹히지 않아 HAL_Delay() 를 써야 했을 것이다.
+       2) I2C 스캔보다 앞에 두었다. 스캔은 127개 주소를 하나씩 두드리느라
+          1초 넘게 걸리는데, 그 뒤로 미루면 진단 결과가 그만큼 늦게 나온다.
+       3) 루프백 시험을 하는 동안에는 바깥에서 들어오는 진짜 프레임을 받지 못한다.
+          그러니 이 "못 받는 구간"은 부팅 직후로 최대한 당겨서 짧게 끝내는 편이 낫다. */
+  Can_LoopbackSelfTest();
 
   /* ================= I2C 버스 스캔 (부팅 후 딱 한 번만) ================= */
   printf("[I2C] 버스 스캔을 시작합니다 (주소 0x01 ~ 0x7F)\r\n");
@@ -264,6 +287,46 @@ void StartDefaultTask(void const * argument)
   {
     osDelay(1000);
 
+    /* ---------- CAN 오류 상태를 매초 새로 읽어 둔다 ---------- */
+    Can_UpdateErrorDiag();
+
+    /* ---------- 버스오프 자동 복구 ----------
+       이 보드는 AutoBusOff 가 꺼져 있어서(CubeMX 에서 AutoBusOff = DISABLE),
+       버스오프에 빠져도 하드웨어가 알아서 빠져나오지 않는다.
+       그래서 소프트웨어가 직접 "초기화 요청"을 걸었다가 풀어 주어야 한다.
+       HAL_CAN_Stop() 이 초기화 요청을 걸고 HAL_CAN_Start() 가 그것을 푸는데,
+       이 과정을 거쳐야 컨트롤러가 버스가 조용해지기를 기다렸다가 다시 합류한다. */
+    if (g_diag_can_boff != 0u)
+    {
+      g_diag_can_recover_cnt++;
+      printf("[CAN] 버스오프 감지 - 복구를 시도합니다 (누적 %lu회)\r\n",
+             (unsigned long)g_diag_can_recover_cnt);
+
+      if (HAL_CAN_Stop(&hcan) != HAL_OK)
+      {
+        g_diag_can_started = 0u;
+      }
+      else if (HAL_CAN_Start(&hcan) != HAL_OK)
+      {
+        g_diag_can_started = 0u;
+      }
+      else
+      {
+        g_diag_can_started = 1u;
+        /* Stop/Start 로는 수신 인터럽트 설정이 지워지지 않지만,
+           복구한 뒤에는 확실히 켜져 있어야 하므로 한 번 더 켜 둔다.
+           이미 켜져 있는 것을 또 켜는 것이라 해가 없다. */
+        if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING) == HAL_OK)
+        {
+          g_diag_can_notify_ok = 1u;
+        }
+        else
+        {
+          g_diag_can_notify_ok = 0u;
+        }
+      }
+    }
+
     total = CanRx_GetTotal();
 
     /* 직전 1초 동안 늘어난 개수를 디버거로 볼 수 있게 담아 둔다.
@@ -364,6 +427,240 @@ void StartCanRxTask(void const * argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+/**
+  * @brief  모든 ID 를 통과시키는 수신 필터를 설정한다.
+  *         마스크를 0 으로 두면 ID 를 비교하는 자리가 하나도 없어져
+  *         결과적으로 어떤 ID 든 전부 통과한다.
+  *         지금은 원인을 찾는 것이 목적이라, 버스에 실제로 어떤 ID 가
+  *         흘러다니는지 하나도 빠짐없이 봐야 하므로 일부러 전부 통과시킨다.
+  * @retval 1 = 성공, 0 = 실패
+  */
+static uint8_t Can_SetAcceptAllFilter(void)
+{
+  CAN_FilterTypeDef can_filter = {0};
 
+  can_filter.FilterBank           = 0;
+  can_filter.FilterMode           = CAN_FILTERMODE_IDMASK;
+  can_filter.FilterScale          = CAN_FILTERSCALE_32BIT;
+  can_filter.FilterIdHigh         = 0x0000;
+  can_filter.FilterIdLow          = 0x0000;
+  can_filter.FilterMaskIdHigh     = 0x0000;   /* 마스크 0 = 전부 통과 */
+  can_filter.FilterMaskIdLow      = 0x0000;
+  can_filter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+  can_filter.FilterActivation     = ENABLE;
+  can_filter.SlaveStartFilterBank = 14;
+
+  if (HAL_CAN_ConfigFilter(&hcan, &can_filter) != HAL_OK)
+  {
+    g_diag_can_filter_ok = 0u;
+    return 0u;
+  }
+
+  g_diag_can_filter_ok = 1u;
+  return 1u;
+}
+
+/**
+  * @brief  CAN_ESR(오류 상태 레지스터)를 읽어 진단 변수들을 갱신한다.
+  *         이 레지스터를 통째로 읽어오는 HAL 함수는 따로 없어서
+  *         hcan.Instance->ESR 로 직접 읽는다.
+  */
+static void Can_UpdateErrorDiag(void)
+{
+  uint32_t esr;
+
+  esr = hcan.Instance->ESR;
+  g_diag_can_esr_raw = esr;
+
+  /* RM0008(STM32F1 참조매뉴얼)의 CAN_ESR 비트 배치대로 잘라낸다.
+       비트 0     = EWGF (오류 경고)
+       비트 1     = EPVF (오류 수동)
+       비트 2     = BOFF (버스오프)
+       비트 6~4   = LEC  (마지막 오류 코드)
+       비트 23~16 = TEC  (송신 오류 카운터)
+       비트 31~24 = REC  (수신 오류 카운터)
+     [주의] TEC 가 아래쪽(16비트), REC 가 위쪽(24비트)이다. 순서를 바꿔 쓰면
+     "보내다 난 오류"와 "받다가 난 오류"를 통째로 뒤바꿔 읽게 되어
+     원인을 정반대로 짚게 되므로 반드시 이대로 두어야 한다. */
+  g_diag_can_ewgf = (uint8_t)( esr        & 0x1u);
+  g_diag_can_epvf = (uint8_t)((esr >> 1)  & 0x1u);
+  g_diag_can_boff = (uint8_t)((esr >> 2)  & 0x1u);
+  g_diag_can_lec  = (uint8_t)((esr >> 4)  & 0x7u);
+  g_diag_can_tec  = (uint8_t)((esr >> 16) & 0xFFu);
+  g_diag_can_rec  = (uint8_t)((esr >> 24) & 0xFFu);
+
+  /* HAL 계층이 따로 모아 둔 오류값도 같이 남겨 둔다 */
+  g_diag_can_hal_err = HAL_CAN_GetError(&hcan);
+}
+
+/**
+  * @brief  CAN 컨트롤러 자체가 멀쩡한지 확인하는 루프백 자기진단.
+  *
+  *         루프백 모드는 내보낸 신호를 칩 안에서 곧바로 자기 수신부로
+  *         되돌려 넣는 시험 모드다. 이때 수신 핀(PA11)에서 들어오는 실제 신호는
+  *         아예 무시하므로, 트랜시버가 안 붙어 있든 배선이 끊겼든 상관이 없다.
+  *         그래서 이 시험이 성공하면 클럭·비트타이밍(통신 속도)·필터·인터럽트 같은
+  *         MCU 안쪽 설정이 전부 정상이라는 뜻이 되고,
+  *         남은 원인은 바깥(트랜시버·배선·종단저항·상대 노드)뿐으로 좁혀진다.
+  */
+static void Can_LoopbackSelfTest(void)
+{
+  CAN_TxHeaderTypeDef tx_header = {0};
+  CAN_RxHeaderTypeDef rx_header = {0};
+  uint8_t             tx_data[2];
+  uint8_t             rx_data[8] = {0u};
+  uint32_t            tx_mailbox = 0u;
+  uint32_t            waited_ms  = 0u;
+  uint8_t             got_frame  = 0u;
+
+  tx_data[0] = 0xABu;
+  tx_data[1] = 0xCDu;
+
+  printf("[CAN 자가진단] 루프백 시험을 시작합니다 (바깥 배선과 무관한 내부 시험)\r\n");
+
+  /* ---------- 0단계 : 수신 인터럽트를 잠시 꺼 둔다 ----------
+     [이 단계가 없으면 시험이 통째로 헛돈다]
+     수신 인터럽트가 켜져 있으면, 되돌아온 시험용 프레임을 인터럽트가 먼저
+     낚아채서 수신함(FIFO)을 비워 버린다. 그러면 아래에서 아무리 수신함을
+     들여다봐도 늘 비어 있어서, 멀쩡한데도 "수신 타임아웃(3)"이라는
+     엉뚱한 결과가 나온다.
+     그리고 인터럽트가 가져가 버리면 시험용 프레임이 실제 수신 개수
+     (g_diag_can_total)에 섞여 들어가 통계까지 더럽힌다.
+     HAL_CAN_Stop() 이나 HAL_CAN_Init() 은 인터럽트 설정을 건드리지 않으므로,
+     이렇게 직접 꺼 주어야 한다. */
+  (void)HAL_CAN_DeactivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+  g_diag_can_notify_ok = 0u;
+
+  /* ---------- 1단계 : 루프백 모드로 바꾼다 ----------
+     MX_CAN_Init() 이 이미 정상 모드로 초기화해 둔 상태이므로,
+     일단 멈춘 뒤 모드만 바꿔서 다시 초기화한다.
+     여기서의 멈춤은 실패해도 그냥 넘어간다. 부팅 때 HAL_CAN_Start() 가
+     실패했다면 아직 "멈출 것이 없는" 상태라 오류를 돌려주는데,
+     그래도 다시 초기화하는 데에는 지장이 없기 때문이다. */
+  (void)HAL_CAN_Stop(&hcan);
+  g_diag_can_started = 0u;
+
+  hcan.Init.Mode = CAN_MODE_LOOPBACK;
+
+  if (HAL_CAN_Init(&hcan) != HAL_OK)
+  {
+    /* 아직 프레임을 내보내는 데까지 가지도 못했으므로 송신 실패로 묶는다 */
+    g_diag_can_loopback = 2u;
+    printf("[CAN 자가진단] 결과 2 : 루프백 모드 초기화에 실패했습니다\r\n");
+  }
+  else if (Can_SetAcceptAllFilter() == 0u)
+  {
+    g_diag_can_loopback = 2u;
+    printf("[CAN 자가진단] 결과 2 : 루프백용 필터 설정에 실패했습니다\r\n");
+  }
+  else if (HAL_CAN_Start(&hcan) != HAL_OK)
+  {
+    g_diag_can_loopback = 2u;
+    printf("[CAN 자가진단] 결과 2 : 루프백 모드 시작에 실패했습니다\r\n");
+  }
+  else
+  {
+    /* ---------- 2단계 : 시험용 프레임을 하나 내보낸다 ---------- */
+    tx_header.StdId              = 0x7FFu;   /* 실제 통신에 안 쓰는 값으로 골랐다 */
+    tx_header.ExtId              = 0x0000u;
+    tx_header.IDE                = CAN_ID_STD;
+    tx_header.RTR                = CAN_RTR_DATA;
+    tx_header.DLC                = 2u;
+    tx_header.TransmitGlobalTime = DISABLE;
+
+    if (HAL_CAN_AddTxMessage(&hcan, &tx_header, tx_data, &tx_mailbox) != HAL_OK)
+    {
+      g_diag_can_loopback = 2u;
+      printf("[CAN 자가진단] 결과 2 : 송신함에 프레임을 넣지 못했습니다\r\n");
+    }
+    else
+    {
+      /* ---------- 3단계 : 최대 100ms 동안 되돌아오기를 기다린다 ----------
+         이 함수는 FreeRTOS 스케줄러가 이미 돌고 있는 태스크 안에서 불리므로
+         HAL_Delay() 가 아니라 osDelay() 를 써야 한다.
+         HAL_Delay() 는 기다리는 동안 자리를 안 내주고 붙잡고 있어서
+         다른 태스크가 전부 멈춰 버린다. */
+      while (waited_ms < 100u)
+      {
+        if (HAL_CAN_GetRxFifoFillLevel(&hcan, CAN_RX_FIFO0) > 0u)
+        {
+          got_frame = 1u;
+          break;
+        }
+        osDelay(1);
+        waited_ms++;
+      }
+
+      if (got_frame == 0u)
+      {
+        g_diag_can_loopback = 3u;
+        printf("[CAN 자가진단] 결과 3 : 100ms 안에 되돌아오지 않았습니다\r\n");
+      }
+      else if (HAL_CAN_GetRxMessage(&hcan, CAN_RX_FIFO0,
+                                    &rx_header, rx_data) != HAL_OK)
+      {
+        g_diag_can_loopback = 3u;
+        printf("[CAN 자가진단] 결과 3 : 되돌아온 프레임을 꺼내지 못했습니다\r\n");
+      }
+      /* ---------- 4단계 : 보낸 것과 같은 내용인지 대조한다 ---------- */
+      else if ((rx_header.IDE   != CAN_ID_STD) ||
+               (rx_header.StdId != 0x7FFu)     ||
+               (rx_header.DLC   != 2u)         ||
+               (rx_data[0]      != 0xABu)      ||
+               (rx_data[1]      != 0xCDu))
+      {
+        g_diag_can_loopback = 4u;
+        printf("[CAN 자가진단] 결과 4 : 되돌아온 내용이 보낸 것과 다릅니다\r\n");
+      }
+      else
+      {
+        g_diag_can_loopback = 1u;
+        printf("[CAN 자가진단] 결과 1 : 성공 - MCU 안쪽 CAN 설정은 정상입니다\r\n");
+      }
+    }
+  }
+
+  /* ---------- 5단계 : 반드시 정상 모드로 되돌린다 ----------
+     [가장 중요한 단계]
+     이 되돌리기가 한 군데라도 실패하면 이후 실제 통신이 영영 되지 않는다.
+     그래서 단계마다 결과를 하나하나 확인하고,
+     전부 성공했을 때에만 g_diag_can_restore_ok 를 1 로 둔다.
+     위쪽 시험이 어떤 결과로 끝났든(성공이든 실패든) 이 되돌리기는
+     if/else 바깥에 두어 항상 실행되도록 했다. */
+  g_diag_can_restore_ok = 0u;
+
+  (void)HAL_CAN_Stop(&hcan);
+  g_diag_can_started = 0u;
+
+  hcan.Init.Mode = CAN_MODE_NORMAL;
+
+  if (HAL_CAN_Init(&hcan) != HAL_OK)
+  {
+    printf("[CAN 자가진단] 되돌리기 실패 : 정상 모드 초기화가 안 됩니다\r\n");
+  }
+  else if (Can_SetAcceptAllFilter() == 0u)
+  {
+    printf("[CAN 자가진단] 되돌리기 실패 : 정상 모드 필터 재설정이 안 됩니다\r\n");
+  }
+  else if (HAL_CAN_Start(&hcan) != HAL_OK)
+  {
+    printf("[CAN 자가진단] 되돌리기 실패 : 정상 모드 시작이 안 됩니다\r\n");
+  }
+  else
+  {
+    g_diag_can_started = 1u;
+
+    if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
+    {
+      printf("[CAN 자가진단] 되돌리기 실패 : 수신 인터럽트를 다시 켜지 못했습니다\r\n");
+    }
+    else
+    {
+      g_diag_can_notify_ok   = 1u;
+      g_diag_can_restore_ok  = 1u;   /* 모든 단계가 성공했다 */
+      printf("[CAN 자가진단] 정상 모드로 되돌렸습니다 (이제부터 실제 수신을 기다립니다)\r\n");
+    }
+  }
+}
 /* USER CODE END Application */
 
