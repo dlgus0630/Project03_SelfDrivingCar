@@ -67,6 +67,7 @@ extern volatile uint32_t g_vdiag_can_tx_ok;
 extern volatile uint32_t g_vdiag_can_tx_fail;
 extern volatile uint32_t g_vdiag_can_free_mb;
 extern volatile uint32_t g_vdiag_can_recover_cnt;
+extern volatile uint8_t  g_vdiag_can_unrecoverable;
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

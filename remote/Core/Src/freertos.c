@@ -29,6 +29,8 @@
 #include "i2c.h"
 /* CAN 손잡이(hcan)와 CAN 관련 HAL 함수들을 쓰기 위해 필요하다 */
 #include "can.h"
+/* MPU-9255 자세 추정(초기화 / 한 걸음 갱신 / 각도 읽기)을 쓰기 위해 필요하다 */
+#include "mpu9255.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -53,6 +55,12 @@
    상대 노드가 100ms 마다 보내므로 전부 찍으면 화면이 순식간에 넘쳐서
    정작 봐야 할 내용을 놓친다. 500ms 간격 = 초당 2개만 찍는다. */
 #define CAN_PRINT_INTERVAL_MS    500u
+
+/* IMU 자세(좌우/앞뒤 기울기)를 실어 보내는 CAN 프레임의 식별자.
+   이 프로젝트에는 메시지 번호를 모아 둔 헤더 계층이 따로 없어서
+   식별자를 이렇게 파일 안의 정의로 두고 쓴다(루프백 시험의 0x7FF 와 같은 방식).
+   받는 쪽(vehicle)도 똑같이 0x120 으로 맞춰 두었으므로 함부로 바꾸면 안 된다. */
+#define CAN_ID_IMU_ATTITUDE      0x120u
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -62,7 +70,12 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-
+/* IMU 태스크의 손잡이.
+   [바로 아래 defaultTaskHandle 옆에 두지 않고 굳이 여기에 두는 이유]
+   아래 두 줄은 CubeMX 가 직접 만들어 관리하는 자리라 USER CODE 구역 밖이다.
+   그 옆에 끼워 넣으면 다시 만들기(Generate Code) 한 번에 소리 없이 사라진다.
+   여기 Variables 구역은 CubeMX 가 건드리지 않고 지켜 주는 자리다. */
+osThreadId ImuTaskHandle;
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
 osThreadId CanRxTaskHandle;
@@ -80,6 +93,11 @@ static void Can_LoopbackSelfTest(void);
 
 /* CAN_ESR(오류 상태 레지스터)를 읽어 진단 변수들을 갱신한다. */
 static void Can_UpdateErrorDiag(void);
+
+/* IMU 태스크 본체. 20ms 마다 센서를 읽어 자세를 갱신하고,
+   그 가운데 다섯 번에 한 번(=100ms)씩 자세를 CAN 으로 내보낸다.
+   osThreadDef() 가 이 이름을 그대로 가져다 쓰므로 static 으로 두면 안 된다. */
+void StartImuTask(void const * argument);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void const * argument);
@@ -140,6 +158,18 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
+
+  /* IMU 자세 추정 태스크.
+     [우선순위를 Normal 로 두는 이유]
+     20ms 라는 정해진 간격으로 표본을 떠야 자이로 적분이 맞는다.
+     CanRxTask(osPriorityIdle) 처럼 낮게 두면 다른 태스크에 계속 밀려
+     간격이 들쭉날쭉해지고, 그만큼 각도가 실제와 어긋난다.
+     [스택을 256(워드)로 두는 이유]
+     이 칩에는 부동소수점 계산기가 없어서 float 연산이 전부 함수 호출로 풀린다.
+     atan2f / sqrtf 는 그 안에서 다시 여러 겹으로 파고들며 스택을 꽤 쓴다.
+     기본값 128 로는 아슬아슬해서, 넉넉하게 CanRxTask 와 같은 256 으로 잡았다. */
+  osThreadDef(ImuTask, StartImuTask, osPriorityNormal, 0, 256);
+  ImuTaskHandle = osThreadCreate(osThread(ImuTask), NULL);
   /* USER CODE END RTOS_THREADS */
 
 }
@@ -161,6 +191,8 @@ void StartDefaultTask(void const * argument)
   const char  *chip_name;
   uint32_t     total;
   uint32_t     prev_total  = 0u;   /* 1초 전의 총 수신 개수 */
+  HAL_StatusTypeDef stop_st;       /* HAL_CAN_Stop() 이 돌려준 결과 */
+  HAL_StatusTypeDef start_st;      /* HAL_CAN_Start() 가 돌려준 결과 */
 
   /* ================= CAN 루프백 자기진단 (부팅 후 딱 한 번만) =================
      [왜 여기인가]
@@ -210,6 +242,17 @@ void StartDefaultTask(void const * argument)
         printf("[I2C]   0x%02X 응답\r\n", (unsigned int)addr);
       }
     }
+
+    /* 주소 하나를 두드릴 때마다 잠깐 자리를 내준다.
+       HAL_I2C_IsDeviceReady() 는 응답이 올 때까지 붙잡고 있는 함수라,
+       이 태스크(osPriorityNormal)가 127개 주소를 내리 두드리는 동안
+       우선순위가 낮은 CanRxTask(osPriorityIdle)는 아예 돌지 못한다.
+       그동안 들어온 CAN 프레임은 아무도 꺼내 가지 않아 원형 버퍼에 쌓이기만 하고,
+       버퍼가 꽉 차면 그 뒤 프레임은 그냥 버려진다.
+       그래서 부팅 중에 들어온 CAN 프레임이 소리 없이 사라진다.
+       여기서 1ms 씩 자리를 넘겨 주면 CanRxTask 가 그 틈에 버퍼를 비워 낼 수 있다.
+       스캔 전체가 127ms 쯤 길어지지만, 프레임을 잃는 것보다는 낫다. */
+    osDelay(1);
   }
 
   printf("[I2C] 스캔 완료: 모두 %u개 장치가 응답했습니다\r\n", (unsigned int)found_count);
@@ -295,34 +338,116 @@ void StartDefaultTask(void const * argument)
        버스오프에 빠져도 하드웨어가 알아서 빠져나오지 않는다.
        그래서 소프트웨어가 직접 "초기화 요청"을 걸었다가 풀어 주어야 한다.
        HAL_CAN_Stop() 이 초기화 요청을 걸고 HAL_CAN_Start() 가 그것을 푸는데,
-       이 과정을 거쳐야 컨트롤러가 버스가 조용해지기를 기다렸다가 다시 합류한다. */
+       이 과정을 거쳐야 컨트롤러가 버스가 조용해지기를 기다렸다가 다시 합류한다.
+
+       [먼저 손잡이 상태를 확인해야 하는 이유]
+       HAL_CAN_Stop() 은 손잡이 상태가 LISTENING 일 때만, HAL_CAN_Start() 는
+       READY 일 때만 실제로 하드웨어를 건드린다. 그 밖의 상태에서는 하드웨어를
+       건드리지도 않고 그 자리에서 곧바로 오류만 돌려준다.
+       그래서 한 번 실패해 상태가 ERROR 로 굳어 버리면, 그 뒤로는 1초마다 불러 봐야
+       전부 헛물만 켠다. 그런데도 시도 횟수만 계속 오르면 "열심히 복구하는 중"으로
+       잘못 읽히므로, 시도할 수 있는 상태인지 먼저 보고 그때에만 횟수를 올린다.
+
+       [실패를 삼키지 않는다]
+       막혔거나 실패했으면 g_diag_can_stuck 에 그 사실을 남긴다.
+       이 값은 지금 형편을 그대로 비추는 값이라, 나중에 온전히 성공하면 다시 0 이 된다.
+       다만 알림은 0 에서 1 로 바뀌는 순간에만 찍는다.
+       1초마다 도는 고리라서 매번 찍으면 UART 가 같은 말로 뒤덮이기 때문이다. */
     if (g_diag_can_boff != 0u)
     {
-      g_diag_can_recover_cnt++;
-      printf("[CAN] 버스오프 감지 - 복구를 시도합니다 (누적 %lu회)\r\n",
-             (unsigned long)g_diag_can_recover_cnt);
+      if (hcan.State != HAL_CAN_STATE_LISTENING)
+      {
+        /* 멈추기(Stop)를 받아 주지 않는 상태다. 여기서는 시도 자체가 불가능하므로
+           복구 시도 횟수는 올리지 않는다. 하지도 않은 시도를 센 셈이 되기 때문이다.
+           수신 인터럽트도 끄지 않는다. 여기서는 사이에 낀 Stop/Start 가 없어
+           막아 줄 구간 자체가 없을뿐더러, 꺼 두면 다시 켤 길이 없어
+           수신이 영영 막혀 버린다. */
+        g_diag_can_started = 0u;
 
-      if (HAL_CAN_Stop(&hcan) != HAL_OK)
-      {
-        g_diag_can_started = 0u;
-      }
-      else if (HAL_CAN_Start(&hcan) != HAL_OK)
-      {
-        g_diag_can_started = 0u;
+        if (g_diag_can_stuck == 0u)
+        {
+          g_diag_can_stuck = 1u;
+          printf("[CAN] 버스오프인데 CAN 손잡이가 Stop/Start 를 받지 않는 상태입니다 (상태값 %u) - MCU 를 리셋해야 풀립니다\r\n",
+                 (unsigned int)hcan.State);
+        }
       }
       else
       {
-        g_diag_can_started = 1u;
-        /* Stop/Start 로는 수신 인터럽트 설정이 지워지지 않지만,
-           복구한 뒤에는 확실히 켜져 있어야 하므로 한 번 더 켜 둔다.
-           이미 켜져 있는 것을 또 켜는 것이라 해가 없다. */
-        if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING) == HAL_OK)
+        g_diag_can_recover_cnt++;
+        printf("[CAN] 버스오프 감지 - 복구를 시도합니다 (누적 %lu회)\r\n",
+               (unsigned long)g_diag_can_recover_cnt);
+
+        /* 수신 인터럽트를 잠시 꺼 둔다. Can_LoopbackSelfTest() 가 하는 것과 같은 이유다.
+           수신 인터럽트 콜백은 CAN 수신 인터럽트에서 곧바로 불려 나와
+           여기와 똑같은 hcan 손잡이를 건드린다. Stop/Start 로 손잡이 상태가 바뀌는
+           도중에 그 일이 겹치면 서로 어긋난 값을 보게 되므로,
+           전환이 끝날 때까지는 아예 끼어들지 못하게 막아 둔다. */
+        (void)HAL_CAN_DeactivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+        g_diag_can_notify_ok = 0u;
+
+        stop_st = HAL_CAN_Stop(&hcan);
+
+        if (stop_st != HAL_OK)
         {
-          g_diag_can_notify_ok = 1u;
+          g_diag_can_started = 0u;
+
+          if (g_diag_can_stuck == 0u)
+          {
+            g_diag_can_stuck = 1u;
+            printf("[CAN] 복구 실패 : 멈추기(Stop)가 되지 않습니다 (상태값 %u)\r\n",
+                   (unsigned int)hcan.State);
+          }
+        }
+        else if (hcan.State != HAL_CAN_STATE_READY)
+        {
+          /* 멈추기는 성공했다는데 손잡이가 시작(Start)이 요구하는 상태(READY)가 아니다.
+             이대로 시작을 불러 봐야 하드웨어를 건드리지도 못하고 실패만 하므로
+             아예 부르지 않고 여기서 접는다. */
+          g_diag_can_started = 0u;
+
+          if (g_diag_can_stuck == 0u)
+          {
+            g_diag_can_stuck = 1u;
+            printf("[CAN] 복구 실패 : 멈춘 뒤에도 시작할 수 있는 상태가 아닙니다 (상태값 %u)\r\n",
+                   (unsigned int)hcan.State);
+          }
         }
         else
         {
-          g_diag_can_notify_ok = 0u;
+          start_st = HAL_CAN_Start(&hcan);
+
+          if (start_st != HAL_OK)
+          {
+            g_diag_can_started = 0u;
+
+            if (g_diag_can_stuck == 0u)
+            {
+              g_diag_can_stuck = 1u;
+              printf("[CAN] 복구 실패 : 다시 시작(Start)이 되지 않습니다 (상태값 %u)\r\n",
+                     (unsigned int)hcan.State);
+            }
+          }
+          else
+          {
+            g_diag_can_started = 1u;
+            /* 이번 시도가 온전히 성공했으니 지금은 막힌 상태가 아니다.
+               이 값은 지난 일을 붙박이로 남기는 표시가 아니라
+               지금 형편을 비추는 값이라서, 성공했으면 반드시 0 으로 되돌려야 한다. */
+            g_diag_can_stuck = 0u;
+
+            /* 위에서 일부러 꺼 두었던 수신 인터럽트를 다시 켠다.
+               예전에는 "지워지지도 않지만 확인 삼아 한 번 더" 켜는 것이었지만,
+               이제는 우리가 직접 껐으므로 여기서 반드시 다시 켜야 한다.
+               이걸 빼먹으면 복구는 되었는데 프레임을 하나도 못 받는 꼴이 된다. */
+            if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING) == HAL_OK)
+            {
+              g_diag_can_notify_ok = 1u;
+            }
+            else
+            {
+              g_diag_can_notify_ok = 0u;
+            }
+          }
         }
       }
     }
@@ -511,7 +636,9 @@ static void Can_LoopbackSelfTest(void)
   uint8_t             rx_data[8] = {0u};
   uint32_t            tx_mailbox = 0u;
   uint32_t            waited_ms  = 0u;
-  uint8_t             got_frame  = 0u;
+  uint8_t             match_found = 0u;  /* 내가 보낸 시험용 프레임과 같은 것을 받았으면 1 */
+  uint8_t             rx_fail     = 0u;  /* 수신함에서 꺼내는 것 자체가 실패했으면 1 */
+  uint8_t             other_seen  = 0u;  /* 시험용이 아닌 남의 프레임을 하나라도 받았으면 1 */
 
   tx_data[0] = 0xABu;
   tx_data[1] = 0xCDu;
@@ -579,43 +706,68 @@ static void Can_LoopbackSelfTest(void)
          이 함수는 FreeRTOS 스케줄러가 이미 돌고 있는 태스크 안에서 불리므로
          HAL_Delay() 가 아니라 osDelay() 를 써야 한다.
          HAL_Delay() 는 기다리는 동안 자리를 안 내주고 붙잡고 있어서
-         다른 태스크가 전부 멈춰 버린다. */
-      while (waited_ms < 100u)
+         다른 태스크가 전부 멈춰 버린다.
+
+         [맨 앞의 한 개만 보고 판정하면 안 되는 이유]
+         지금 모드는 루프백이지만 silent 는 아니다. 그래서 수신 핀으로 들어오는
+         바깥 노드의 진짜 프레임도 그대로 수신함에 쌓인다.
+         내가 보낸 시험용 프레임보다 남의 프레임이 먼저 들어와 있을 수 있는데,
+         맨 앞의 것 하나만 꺼내 대조하면 CAN 하드웨어가 멀쩡한데도
+         "데이터 불일치" 라는 엉뚱한 결과가 나온다.
+         그래서 하나씩 꺼내 보면서, 내 것이 나올 때까지 남의 것은 버리고 계속 기다린다.
+         남의 프레임을 버린 뒤에도 아래 osDelay(1) 로 내려가 waited_ms 가 오르므로,
+         전체로 기다리는 시간은 예전과 똑같이 100ms 를 넘지 않는다. */
+      while ((waited_ms < 100u) && (match_found == 0u) && (rx_fail == 0u))
       {
         if (HAL_CAN_GetRxFifoFillLevel(&hcan, CAN_RX_FIFO0) > 0u)
         {
-          got_frame = 1u;
-          break;
+          if (HAL_CAN_GetRxMessage(&hcan, CAN_RX_FIFO0, &rx_header, rx_data) != HAL_OK)
+          {
+            rx_fail = 1u;
+          }
+          else if ((rx_header.IDE   == CAN_ID_STD) &&
+                   (rx_header.StdId == 0x7FFu)     &&
+                   (rx_header.DLC   == 2u)         &&
+                   (rx_data[0]      == 0xABu)      &&
+                   (rx_data[1]      == 0xCDu))
+          {
+            match_found = 1u;
+          }
+          else
+          {
+            other_seen = 1u;   /* 남의 프레임 - 버리고 계속 기다린다 */
+          }
         }
-        osDelay(1);
-        waited_ms++;
+
+        if ((match_found == 0u) && (rx_fail == 0u))
+        {
+          osDelay(1);
+          waited_ms++;
+        }
       }
 
-      if (got_frame == 0u)
+      /* ---------- 4단계 : 기다린 결과를 판정한다 ---------- */
+      if (match_found != 0u)
       {
-        g_diag_can_loopback = 3u;
-        printf("[CAN 자가진단] 결과 3 : 100ms 안에 되돌아오지 않았습니다\r\n");
+        g_diag_can_loopback = 1u;
+        printf("[CAN 자가진단] 결과 1 : 성공 - MCU 안쪽 CAN 설정은 정상입니다\r\n");
       }
-      else if (HAL_CAN_GetRxMessage(&hcan, CAN_RX_FIFO0,
-                                    &rx_header, rx_data) != HAL_OK)
+      else if (rx_fail != 0u)
       {
         g_diag_can_loopback = 3u;
         printf("[CAN 자가진단] 결과 3 : 되돌아온 프레임을 꺼내지 못했습니다\r\n");
       }
-      /* ---------- 4단계 : 보낸 것과 같은 내용인지 대조한다 ---------- */
-      else if ((rx_header.IDE   != CAN_ID_STD) ||
-               (rx_header.StdId != 0x7FFu)     ||
-               (rx_header.DLC   != 2u)         ||
-               (rx_data[0]      != 0xABu)      ||
-               (rx_data[1]      != 0xCDu))
+      else if (other_seen == 0u)
       {
-        g_diag_can_loopback = 4u;
-        printf("[CAN 자가진단] 결과 4 : 되돌아온 내용이 보낸 것과 다릅니다\r\n");
+        /* 수신함에 아무것도 들어오지 않았다 */
+        g_diag_can_loopback = 3u;
+        printf("[CAN 자가진단] 결과 3 : 100ms 안에 되돌아오지 않았습니다\r\n");
       }
       else
       {
-        g_diag_can_loopback = 1u;
-        printf("[CAN 자가진단] 결과 1 : 성공 - MCU 안쪽 CAN 설정은 정상입니다\r\n");
+        /* 남의 프레임은 들어왔는데 내 시험용 프레임만 끝내 안 왔다 */
+        g_diag_can_loopback = 4u;
+        printf("[CAN 자가진단] 결과 4 : 100ms 안에 시험용 프레임(0x7FF)이 되돌아오지 않았습니다 (다른 프레임만 들어왔습니다)\r\n");
       }
     }
   }
@@ -659,6 +811,151 @@ static void Can_LoopbackSelfTest(void)
       g_diag_can_notify_ok   = 1u;
       g_diag_can_restore_ok  = 1u;   /* 모든 단계가 성공했다 */
       printf("[CAN 자가진단] 정상 모드로 되돌렸습니다 (이제부터 실제 수신을 기다립니다)\r\n");
+    }
+  }
+}
+
+/**
+  * @brief  IMU 자세 추정 태스크.
+  *
+  *         20ms(=50Hz) 마다 MPU-9255 에서 가속도와 자이로를 읽어
+  *         상보필터를 한 걸음씩 전진시키고, 그 가운데 다섯 번에 한 번
+  *         (=100ms) 씩 지금 자세를 CAN 프레임 0x120 으로 내보낸다.
+  *
+  *         [센서는 50Hz 로 읽으면서 송신은 10Hz 로 낮추는 이유]
+  *         자이로 적분은 촘촘할수록 정확해지므로 읽기는 자주 해야 한다.
+  *         하지만 자세라는 값 자체는 그렇게 빨리 변하지 않아서
+  *         받는 쪽에 100ms 마다 알려 주는 것으로 충분하다.
+  *         50Hz 로 그대로 내보내면 버스만 다섯 배로 붐빈다.
+  * @param  argument: 쓰지 않는다
+  * @retval None
+  */
+void StartImuTask(void const * argument)
+{
+  CAN_TxHeaderTypeDef tx_header    = {0};
+  uint8_t             data[8];
+  uint32_t            tx_mailbox   = 0u;
+  int16_t             rollTenths;    /* 좌우 기울기를 0.1도 단위 정수로 바꾼 값 */
+  int16_t             pitchTenths;   /* 앞뒤 기울기를 0.1도 단위 정수로 바꾼 값 */
+  uint8_t             init_ok;       /* 초기화가 모든 단계 성공했으면 1 */
+  static uint8_t      txDivider    = 0u;  /* 다섯 번에 한 번만 보내려고 세는 값 */
+  static uint8_t      frameCounter = 0u;  /* 보낸 프레임에 붙이는 돌림 번호 */
+
+  printf("[IMU] 자세 추정을 시작합니다 (%ums 마다 표본, %ums 마다 CAN 0x%03X 송신)\r\n",
+         (unsigned int)IMU_TASK_PERIOD_MS,
+         (unsigned int)(IMU_TASK_PERIOD_MS * 5u),
+         (unsigned int)CAN_ID_IMU_ATTITUDE);
+  printf("[IMU] 자이로 영점을 재는 동안(약 1초) 보드를 움직이지 마세요\r\n");
+
+  /* ---------- 센서를 깨우고 설정한 뒤 자이로 영점까지 잰다 (딱 한 번) ----------
+     이 안에서 약 1초 동안 osDelay() 로 쉬어 가며 200번을 읽으므로,
+     그동안 다른 태스크(부팅 중이라면 I2C 스캔과 CAN 수신)는 정상으로 돌아간다. */
+  init_ok = Mpu9255_Init();
+
+  if (init_ok != 0u)
+  {
+    printf("[IMU] 준비 완료 : WHO_AM_I=0x%02X, 자이로 영점 측정을 마쳤습니다\r\n",
+           (unsigned int)Mpu9255_GetWhoAmI());
+  }
+  else
+  {
+    /* 일부 단계가 실패해도 태스크를 멈추지는 않는다.
+       I2C 가 잠깐 겹쳐서 실패했을 뿐 곧 정상으로 돌아오는 경우가 많고,
+       설령 계속 실패하더라도 상태 바이트의 0번 비트가 0 으로 나가므로
+       받는 쪽이 "이 각도는 믿으면 안 된다"를 스스로 알아챌 수 있다. */
+    printf("[IMU] 준비 중 일부 단계가 실패했습니다 : WHO_AM_I=0x%02X, 영점측정=%u\r\n",
+           (unsigned int)Mpu9255_GetWhoAmI(),
+           (unsigned int)Mpu9255_IsCalibrated());
+  }
+
+  /* ---------- 송신 머리말은 매번 똑같으므로 고리 밖에서 한 번만 채워 둔다 ----------
+     루프백 자기진단이 프레임을 만들던 방식과 똑같이 맞췄다. */
+  tx_header.StdId              = CAN_ID_IMU_ATTITUDE;
+  tx_header.ExtId              = 0x0000u;
+  tx_header.IDE                = CAN_ID_STD;
+  tx_header.RTR                = CAN_RTR_DATA;
+  tx_header.DLC                = 8u;
+  tx_header.TransmitGlobalTime = DISABLE;
+
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(IMU_TASK_PERIOD_MS);
+
+    /* 표본 한 번 + 상보필터 한 걸음.
+       읽기에 실패하면 0 을 돌려주는데, 그때는 각도가 직전 값 그대로 남는다.
+       한두 번 놓친 것으로 자세가 크게 어긋나지는 않으므로 그냥 넘어간다. */
+    (void)Mpu9255_Update();
+
+    txDivider++;
+
+    if (txDivider >= 5u)
+    {
+      txDivider = 0u;
+
+      /* ---------- 송신함에 빈자리가 있는지 먼저 본다 ----------
+         [기다리지도 않고 다시 시도하지도 않는 이유]
+         이것은 100ms 마다 되풀이되는 알림용 프레임이다. 다음 것이 곧 또 온다.
+         빈자리가 날 때까지 여기서 붙잡고 있으면 그 사이 20ms 표본 주기가
+         통째로 밀려 자이로 적분 간격이 어긋나고, 정작 더 중요한
+         자세 추정 자체가 망가진다.
+         버스가 막혔거나 상대가 응답을 안 해서 송신함이 찼다면
+         그것은 여기서 버틴다고 풀리는 문제도 아니다.
+         그러니 이번 차례는 깨끗이 포기하고 다음 100ms 를 기다리는 편이 낫다.
+         빠뜨린 것은 아래 돌림 번호가 그대로 알려 준다. */
+      if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) > 0u)
+      {
+        /* ================= CAN 0x120 IMU_ATTITUDE 8바이트 배치 =================
+             바이트 0 : 좌우 기울기(roll)  상위 8비트
+             바이트 1 : 좌우 기울기(roll)  하위 8비트
+             바이트 2 : 앞뒤 기울기(pitch) 상위 8비트
+             바이트 3 : 앞뒤 기울기(pitch) 하위 8비트
+             바이트 4 : 방위각(yaw) 상위 8비트 - 항상 0x00
+             바이트 5 : 방위각(yaw) 하위 8비트 - 항상 0x00
+             바이트 6 : 상태 비트 (0번 비트 = 자이로 영점 측정 완료, 나머지는 0)
+             바이트 7 : 돌림 번호 (보낼 때마다 1씩 오르고 256에서 0으로 돌아온다)
+
+           각도는 0.1도를 한 칸으로 하는 부호 있는 16비트 값이고,
+           큰 자리를 앞에 두는 빅엔디언으로 싣는다.
+           예) -12.3도 -> -123 -> 0xFF 0x85
+
+           [yaw 가 늘 0 인 이유]
+           이번 단계에서는 나침반(AK8963)을 읽지 않아 방위각을 구할 수 없다.
+           자리는 미리 비워 두어, 나중에 나침반을 붙일 때 프레임 모양을
+           바꾸지 않고 그 두 칸만 채우면 되게 해 두었다.
+
+           [돌림 번호를 왜 싣는가]
+           받는 쪽에서 번호가 1씩 오르지 않고 건너뛰면 그 사이 프레임이
+           빠졌다는 뜻이다. 위에서 송신함이 차서 한 차례 거른 경우도
+           이 번호로 드러난다.
+
+           ※ 받는 쪽(vehicle)이 이 표를 그대로 보고 풀어내므로,
+              한 칸이라도 순서를 바꾸면 양쪽이 통째로 어긋난다. */
+
+        rollTenths  = (int16_t)(Mpu9255_GetRollDeg()  * 10.0f);
+        pitchTenths = (int16_t)(Mpu9255_GetPitchDeg() * 10.0f);
+
+        /* 부호 있는 값을 오른쪽으로 밀 때의 동작은 표준이 딱 정해 두지 않았다.
+           그래서 부호 없는 형으로 한 번 바꾼 뒤에 민다.
+           두 값 모두 같은 비트를 담고 있으므로 실제로 나가는 바이트는 똑같지만,
+           이렇게 두면 컴파일러가 달라져도 결과가 흔들리지 않는다. */
+        data[0] = (uint8_t)(((uint16_t)rollTenths  >> 8) & 0xFFu);
+        data[1] = (uint8_t)( (uint16_t)rollTenths        & 0xFFu);
+        data[2] = (uint8_t)(((uint16_t)pitchTenths >> 8) & 0xFFu);
+        data[3] = (uint8_t)( (uint16_t)pitchTenths       & 0xFFu);
+        data[4] = 0x00u;
+        data[5] = 0x00u;
+        data[6] = (uint8_t)(Mpu9255_IsCalibrated() & 0x01u);
+        data[7] = frameCounter;
+
+        /* 돌림 번호는 "실제로 내보낸 프레임"에만 붙어야 한다.
+           송신함에 넣는 데까지 성공했을 때에만 다음 번호로 넘긴다.
+           uint8_t 라서 255 다음은 저절로 0 으로 돌아온다. */
+        if (HAL_CAN_AddTxMessage(&hcan, &tx_header, data, &tx_mailbox) == HAL_OK)
+        {
+          frameCounter++;
+        }
+      }
     }
   }
 }

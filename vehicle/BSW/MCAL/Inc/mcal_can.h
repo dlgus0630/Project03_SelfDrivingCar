@@ -31,6 +31,7 @@
  * ------------------------------------------------------------------------ */
 #define MCAL_CAN_ID_MASTER_MODE_CMD      0x100u  /* 수동/자동 모드 전환 */
 #define MCAL_CAN_ID_MASTER_MANUAL_CMD    0x110u  /* 수동 조향/속도 명령 */
+#define MCAL_CAN_ID_REMOTE_IMU_ATTITUDE  0x120u  /* remote 노드 IMU roll/pitch (0.1도 단위) */
 #define MCAL_CAN_ID_SLAVE_STATUS         0x200u  /* 슬레이브 상태/거리값 응답 */
 #define MCAL_CAN_ID_SLAVE_HEARTBEAT      0x3F0u  /* 본 노드 생존 신호 */
 

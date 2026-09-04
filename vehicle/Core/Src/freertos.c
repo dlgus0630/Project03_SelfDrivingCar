@@ -304,6 +304,13 @@ void StartCanTxTask(void const * argument)
    *     읽을 수 있다. */
   uint32_t busOffRetryTick = 0u;
 
+  /* HEARTBEAT(0x3F0) 송신 주기 카운터.
+   * 이 태스크는 100ms 주기이므로 10주기 = 약 1초에 한 번만 생존 신호를 보낸다.
+   * 상태(0x200)는 100ms마다 나가지만, 생존 신호까지 같은 주기로 내보내면
+   * 송신 메일박스(3개)와 버스 대역만 낭비된다. 마스터 입장에서 "이 노드가
+   * 살아 있는가"는 1초 해상도면 충분하다. */
+  uint32_t heartbeatTick = 0u;
+
   for(;;)
   {
     uint32_t esr;
@@ -342,14 +349,69 @@ void StartCanTxTask(void const * argument)
      * 이 소프트웨어 복구 로직을 정식으로 남겨 둔다.) */
     if (g_vdiag_can_boff != 0u)
     {
-      if (busOffRetryTick == 0u)
+      if ((busOffRetryTick == 0u) && (g_vdiag_can_unrecoverable == 0u))
       {
-        g_vdiag_can_recover_cnt++;   /* 복구 시도 횟수 기록 */
+        HAL_StatusTypeDef stopStatus;
+        HAL_StatusTypeDef startStatus;
+
+        /* Stop/Start 전에 수신 인터럽트를 먼저 꺼 둔다.
+         * 이 과정에서 CAN 셀은 초기화 모드로 들어갔다 나오는데, 그 도중에
+         * HAL_CAN_RxFifo0MsgPendingCallback()이 끼어들면 재설정 중인
+         * 같은 hcan 핸들을 동시에 건드리게 된다.
+         * HAL_CAN_Stop()은 인터럽트 설정을 건드리지 않으므로 직접 꺼야 한다. */
+        (void)HAL_CAN_DeactivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
 
         /* Stop -> Start 로 CAN 셀을 초기화 모드에 넣었다 빼면서
-         * 버스오프 복구 시퀀스를 다시 시작시킨다. */
-        (void)HAL_CAN_Stop(&hcan);
-        (void)HAL_CAN_Start(&hcan);
+         * 버스오프 복구 시퀀스를 다시 시작시킨다.
+         * HAL_CAN_Stop()은 State가 LISTENING일 때만 성공한다. 다른 상태
+         * (특히 이전 시도가 타임아웃되어 굳어버린 HAL_CAN_STATE_ERROR)에서는
+         * 내부 가드에 막혀 아무 일도 하지 않고 HAL_ERROR만 돌려주므로,
+         * 조건을 미리 확인해 헛된 호출을 피한다. */
+        if (hcan.State == HAL_CAN_STATE_LISTENING)
+        {
+          stopStatus = HAL_CAN_Stop(&hcan);
+        }
+        else
+        {
+          stopStatus = HAL_ERROR;
+        }
+
+        /* HAL_CAN_Start()는 State가 READY일 때만 성공한다.
+         * Stop이 정상적으로 끝나야 READY가 되므로 두 조건을 함께 확인한다. */
+        if ((stopStatus == HAL_OK) && (hcan.State == HAL_CAN_STATE_READY))
+        {
+          startStatus = HAL_CAN_Start(&hcan);
+        }
+        else
+        {
+          startStatus = HAL_ERROR;
+        }
+
+        if ((stopStatus == HAL_OK) && (startStatus == HAL_OK))
+        {
+          /* 재시작이 실제로 끝난 뒤에야 수신 인터럽트를 다시 켠다. */
+          (void)HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+
+          /* 시퀀스 전체가 성공했을 때만 센다. 그래야 이 값을 원래 의도대로
+           * "버스오프였던 시간(초)"으로 읽을 수 있다. */
+          g_vdiag_can_recover_cnt++;
+        }
+        else
+        {
+          /* 실패 경로에서도 수신 인터럽트를 다시 켜 두어, 우리가 끈 인터럽트가
+           * 영구히 꺼진 채로 남지 않게 한다. 다만 셀이 HAL_CAN_STATE_ERROR로
+           * 굳었다면 HAL_CAN_ActivateNotification()도 같은 내부 가드에 막혀
+           * HAL_ERROR를 돌려준다. 그 경우엔 어차피 CAN 셀 자체가 죽어 있어
+           * 수신도 불가능하므로 이로 인해 잃는 기능은 없다. */
+          (void)HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+
+          /* Stop/Start가 타임아웃되면 State가 HAL_CAN_STATE_ERROR로 굳어버려,
+           * 이후 같은 Stop/Start를 아무리 반복해도 내부 가드에 막혀 전부
+           * 무의미한 호출이 된다. MCU 리셋 없이는 복구가 불가능하므로
+           * 재시도를 의도적으로 포기하고 플래그를 래치해 둔다.
+           * (정상 경로에서 이 플래그를 자동으로 지우지 않는 이유도 이것이다.) */
+          g_vdiag_can_unrecoverable = 1u;
+        }
       }
 
       busOffRetryTick++;
@@ -363,6 +425,29 @@ void StartCanTxTask(void const * argument)
       /* 정상 상태로 돌아왔으면 다음 버스오프 때 곧바로 복구할 수 있도록
        * 재시도 카운터를 초기화해 둔다. */
       busOffRetryTick = 0u;
+    }
+
+    /* ---- HEARTBEAT(0x3F0) 약 1초 주기 송신 ----
+     * DLC 1바이트짜리 최소 프레임으로 "이 노드가 아직 돌고 있다"를 알린다.
+     * payload[0] : 0 = 정상, 1 = CAN 셀이 복구 불가능 상태로 굳음.
+     *
+     * 위 버스오프 복구 블록이 끝난 뒤에 보내는 이유는, 이번 주기에서 복구를
+     * 시도하다 실패해 g_vdiag_can_unrecoverable이 막 1로 래치된 경우까지
+     * 같은 주기 안에서 곧바로 반영해 내보내기 위해서다.
+     *
+     * 물론 CAN 셀이 정말 죽었다면 이 프레임 자체가 버스로 나가지 못한다.
+     * 그때는 마스터가 "1이라고 알려오는 것"이 아니라 "생존 신호가 끊긴 것"
+     * 으로 고장을 판정하게 된다. payload[0]=1은 셀이 아직 송신은 되지만
+     * 복구를 포기한 어중간한 상태를 구분해 주는 용도다. */
+    heartbeatTick++;
+    if (heartbeatTick >= 10u)   /* 100ms * 10 = 약 1초 */
+    {
+      uint8_t hbPayload[1];
+
+      hbPayload[0] = (g_vdiag_can_unrecoverable != 0u) ? 1u : 0u;
+      (void)MCAL_CAN_Transmit(MCAL_CAN_ID_SLAVE_HEARTBEAT, hbPayload, 1u);
+
+      heartbeatTick = 0u;
     }
 
     osDelay(100);

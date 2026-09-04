@@ -102,6 +102,7 @@ volatile uint32_t g_vdiag_can_tx_ok       = 0u;  /* 송신 요청 성공 누적 
 volatile uint32_t g_vdiag_can_tx_fail     = 0u;  /* 송신 요청 실패 누적 횟수 */
 volatile uint32_t g_vdiag_can_free_mb     = 0u;  /* 비어 있는 송신 메일박스 수 (0~3) */
 volatile uint32_t g_vdiag_can_recover_cnt = 0u;  /* 버스오프 복구 시도 누적 횟수 */
+volatile uint8_t  g_vdiag_can_unrecoverable = 0u;  /* CAN 셀이 굳어 리셋 없이는 복구 불가면 1 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
