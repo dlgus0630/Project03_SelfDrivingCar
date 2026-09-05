@@ -904,6 +904,7 @@ void StartImuTask(void const * argument)
   uint8_t  data[8];
   int16_t  rollTenths;    /* 좌우 기울기를 0.1도 단위 정수로 바꾼 값 */
   int16_t  pitchTenths;   /* 앞뒤 기울기를 0.1도 단위 정수로 바꾼 값 */
+  int16_t  yawTenths;     /* 방위각을 0.1도 단위 정수로 바꾼 값 */
   /* [static 을 붙이지 않는 이유]
      이 태스크는 딱 한 번 들어와서 영영 돌아 나가지 않는다. 그래서 그냥 지역
      변수로 두어도 값은 고리를 도는 내내 그대로 이어진다. static 을 붙이면
@@ -957,8 +958,8 @@ void StartImuTask(void const * argument)
            바이트 1 : 좌우 기울기(roll)  하위 8비트
            바이트 2 : 앞뒤 기울기(pitch) 상위 8비트
            바이트 3 : 앞뒤 기울기(pitch) 하위 8비트
-           바이트 4 : 방위각(yaw) 상위 8비트 - 항상 0x00
-           바이트 5 : 방위각(yaw) 하위 8비트 - 항상 0x00
+           바이트 4 : 방위각(yaw)        상위 8비트
+           바이트 5 : 방위각(yaw)        하위 8비트
            바이트 6 : 상태 비트 (0번 비트 = 자이로 영점 측정 완료, 나머지는 0)
            바이트 7 : 돌림 번호 (보낼 때마다 1씩 오르고 256에서 0으로 돌아온다)
 
@@ -966,10 +967,11 @@ void StartImuTask(void const * argument)
          큰 자리를 앞에 두는 빅엔디언으로 싣는다.
          예) -12.3도 -> -123 -> 0xFF 0x85
 
-         [yaw 가 늘 0 인 이유]
-         이번 단계에서는 나침반(AK8963)을 읽지 않아 방위각을 구할 수 없다.
-         자리는 미리 비워 두어, 나중에 나침반을 붙일 때 프레임 모양을
-         바꾸지 않고 그 두 칸만 채우면 되게 해 두었다.
+         [yaw 를 어디까지 믿어야 하는가]
+         나침반(AK8963)은 여전히 읽지 않는다. 그래서 이 방위각은 자이로 Z축을
+         적분하기만 한 값이고, 되잡아 줄 절대 기준이 없어 시간이 지날수록
+         흘러간다. 받는 쪽은 "이번 회전에서 몇 도 돌았나" 처럼 짧은 구간의
+         차이로만 써야 하고, 몇 분 뒤의 값을 절대 방위로 믿어서는 안 된다.
 
          [돌림 번호를 왜 싣는가]
          받는 쪽에서 번호가 1씩 오르지 않고 건너뛰면 그 사이 프레임이
@@ -981,6 +983,10 @@ void StartImuTask(void const * argument)
 
       rollTenths  = (int16_t)(Mpu9255_GetRollDeg()  * 10.0f);
       pitchTenths = (int16_t)(Mpu9255_GetPitchDeg() * 10.0f);
+      /* 드라이버가 방위각을 -180 ~ +180 안으로 이미 감아 두고 내보내므로,
+         여기 들어오는 값은 아무리 커도 1800 이다. int16_t 에 넉넉히 들어가서
+         이 층에서 따로 잘라 낼 일이 없다. */
+      yawTenths   = (int16_t)(Mpu9255_GetYawDeg()   * 10.0f);
 
       /* 부호 있는 값을 오른쪽으로 밀 때의 동작은 표준이 딱 정해 두지 않았다.
          그래서 부호 없는 형으로 한 번 바꾼 뒤에 민다.
@@ -990,8 +996,8 @@ void StartImuTask(void const * argument)
       data[1] = (uint8_t)( (uint16_t)rollTenths        & 0xFFu);
       data[2] = (uint8_t)(((uint16_t)pitchTenths >> 8) & 0xFFu);
       data[3] = (uint8_t)( (uint16_t)pitchTenths       & 0xFFu);
-      data[4] = 0x00u;
-      data[5] = 0x00u;
+      data[4] = (uint8_t)(((uint16_t)yawTenths   >> 8) & 0xFFu);
+      data[5] = (uint8_t)( (uint16_t)yawTenths         & 0xFFu);
       data[6] = (uint8_t)(Mpu9255_IsCalibrated() & 0x01u);
       data[7] = frameCounter;
 

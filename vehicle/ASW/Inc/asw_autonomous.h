@@ -142,6 +142,12 @@
                                              * 이 시간이 지나도 PIVOT_EXIT_CM 기준을 못 채우면
                                              * 더 도는 대신 느슨한 기준(WARNING_CM)만으로 즉시
                                              * 복귀시켜 왔던 길까지 도는 U턴을 방지한다. */
+#define ASW_AUTO_PIVOT_EXPECT_DEG    90.0f /* 위 EXPECT_MS 주석이 이미 말로 적어 둔 "약 90도 회전"
+                                             * 가정을 그대로 숫자로 옮긴 값이다. 새로 잡은 임의의
+                                             * 튜닝 상수가 아니라, remote IMU yaw로 실제 회전각을
+                                             * 잴 수 있게 된 지금 그 가정을 명시적이고 측정 가능한
+                                             * 형태로 드러낸 것 - 시간(EXPECT_MS)과 각도(EXPECT_DEG)는
+                                             * 같은 "약 90도"를 서로 다른 단위로 표현한 짝이다. */
 #define ASW_AUTO_PIVOT_MAX_MS        1700u /* 초과 시 '갇힘' -> BACKING_UP */
 #define ASW_AUTO_EXIT_CONFIRM        2u    /* 개방 연속 확인 사이클 수 (ARC/PIVOT 공용) */
 

@@ -16,6 +16,7 @@
  *              더 긴 무응답 기준을 두어, 연결 끊김/앱 다운 시에만 정지시킨다.
  */
 #include "asw_manual_control.h"
+#include "asw_imu_attitude.h"
 #include "rte_mode_manager.h"
 #include "rte_motor.h"
 #include <stdio.h>
@@ -171,15 +172,21 @@ void ASW_Manual_ApplyCanCommand(const McalCanMsg_t *p_msg)
         /* remote 노드 IMU 자세(0x120) : 8바이트, 모두 MSB first(빅엔디안).
          *   data[0..1] : roll  (0.1도 단위, int16)
          *   data[2..3] : pitch (0.1도 단위, int16)
-         *   data[4..5] : yaw   (이번 단계에서는 항상 0 -> 사용하지 않음)
-         *   data[6]    : 상태 플래그. bit0 = 캘리브레이션 완료.
-         *                제어를 이 비트로 막지는 않는다. 프레임이 왔다는 것
-         *                자체를 유효한 명령으로 취급한다(사용하지 않음).
+         *   data[4..5] : yaw   (0.1도 단위, int16) -> 자율주행 PIVOT 과회전 가드가 사용.
+         *   data[6]    : 상태 플래그. bit0 = 캘리브레이션 완료 플래그.
+         *                이 비트로 수동 제어를 막지는 않는다(프레임이 왔다는 것
+         *                자체를 유효한 명령으로 취급하는 기존 정책 유지). 대신 공유
+         *                자세 모듈의 yaw 신뢰성 판정에 사용된다.
          *   data[7]    : 롤링 카운터(수신 확인용) -> 사용하지 않음 */
         case MCAL_CAN_ID_REMOTE_IMU_ATTITUDE:
         {
             int16_t rollTenths  = (int16_t)(((uint16_t)p_msg->data[0] << 8) | p_msg->data[1]);
             int16_t pitchTenths = (int16_t)(((uint16_t)p_msg->data[2] << 8) | p_msg->data[3]);
+
+            /* yaw와 캘리브레이션 플래그는 수동 기울기 주행에는 쓰이지 않는다.
+             * 공유 자세 모듈을 거쳐 자율주행 쪽이 읽어 가는 값이라 여기서 함께 푼다. */
+            int16_t yawTenths = (int16_t)(((uint16_t)p_msg->data[4] << 8) | p_msg->data[5]);
+            uint8_t remoteCalibrated = p_msg->data[6] & 0x01u;
 
             /* 여기서는 "받은 각도 그대로" 저장만 한다. duty 변환(부동소수점)은
              * 이 MCU에 FPU가 없어 비싸므로, 최우선순위인 CanRxTask가 아니라
@@ -192,6 +199,15 @@ void ASW_Manual_ApplyCanCommand(const McalCanMsg_t *p_msg)
             s_lastRxTick     = osKernelSysTick();
             s_cmdSource      = ASW_MANUAL_CMD_SOURCE_IMU;
             taskEXIT_CRITICAL();
+
+            /* 공유 자세 모듈 갱신은 일부러 임계구역 "밖"에서 호출한다. 이 함수는
+             * 내부에서 자체적으로 평범한 저장만 하므로, 최우선순위인 CanRxTask가
+             * 쥐고 있는 임계구역을 굳이 더 늘릴 이유가 없다. */
+            /* roll/pitch가 기존 수동제어 statics와 새 공유 모듈 두 곳에 중복 저장되는
+             * 것은 의도한 선택이다. 검증이 끝난 수동 기울기 주행 경로를 새 모듈에서
+             * 읽도록 리팩터링하는 대안은 당장 얻는 것 없이 위험만 늘리므로, 몇 바이트
+             * 중복이 더 싼 거래다. */
+            ASW_ImuAttitude_Apply(rollTenths, pitchTenths, yawTenths, remoteCalibrated);
             break;
         }
 

@@ -57,6 +57,7 @@
  */
 #include "asw_autonomous.h"
 #include "rte_motor.h"
+#include "asw_imu_attitude.h" /* remote IMU 자세(CAN 0x120) - 피벗 회전각 실측용 */
 #include <stdio.h>   /* 진단 로그(printf -> main.c의 __io_putchar -> USART1) */
 
 /* ------------------------------------------------------------------------
@@ -81,6 +82,12 @@ static AswAutoTurnDir_t s_turnDir         = ASW_AUTO_TURN_LEFT;
 static uint32_t         s_turnElapsedMs   = 0u; /* ARC/PIVOT 경과 시간 */
 static uint32_t         s_openCount       = 0u; /* 전방 개방 연속 확인 횟수 */
 static uint32_t         s_backupElapsedMs = 0u;
+
+/* 피벗 진입 순간에 찍어 두는 헤딩 스냅샷과, 그 시점에 IMU를 믿을 수 있었는지 여부.
+ * 진입 때 한 번만 정해지므로 한 번의 피벗은 처음부터 끝까지 하나의 과회전 가드
+ * 모드(각도 기반 / 시간 기반)만 사용하게 된다 */
+static float   s_pivotYawStartDeg = 0.0f;
+static uint8_t s_pivotYawValid    = 0u;
 
 /* 센서 EMA 필터 상태 */
 static uint32_t s_fLeft   = 0u;
@@ -119,6 +126,11 @@ void ASW_Autonomous_Init(void)
     s_curRightDuty    = 0u;
     s_dirScore        = 0;
     s_sinceTurnMs     = 60000u;
+
+    /* 자율모드 재진입 시 이전 주행에서 남은 피벗 기준 헤딩이 그대로 쓰이지 않도록 초기화.
+     * valid=0으로 시작하므로 첫 피벗은 스냅샷을 실제로 뜨기 전까지 시간 기반 가드를 쓴다 */
+    s_pivotYawStartDeg = 0.0f;
+    s_pivotYawValid    = 0u;
 }
 
 /* ------------------------------------------------------------------------
@@ -176,6 +188,16 @@ static void AswAuto_EnterTurnState(AswAutoState_t state, AswAutoTurnDir_t dir)
     s_openCount     = 0u;
     s_sinceTurnMs   = 0u; /* 회전 시작 = 연속 코너 방향 잠금 타이머 리셋 */
     s_filtInit      = 0u; /* 회전 진입 = 방향 전환 -> 이전 방향의 묵은 필터값 제거 */
+
+    /* 제자리 피벗일 때만 회전각 측정 기준을 잡는다. 아크 선회(ARC_TURN)는 회전각이
+     * 궤적 기하학으로 이미 90도 부근에 묶여 있어 과회전 가드 자체가 없으므로
+     * 스냅샷을 뜰 이유가 없다. valid도 여기서 같이 확정해 두어야 피벗 도중
+     * IMU가 뒤늦게 유효해져도 기준값과 가드 모드가 어긋나지 않는다. */
+    if (state == ASW_AUTO_STATE_PIVOT)
+    {
+        s_pivotYawValid    = ASW_ImuAttitude_IsValid();
+        s_pivotYawStartDeg = ASW_ImuAttitude_GetYawDeg();
+    }
 }
 
 /* BACKING_UP 상태 진입 준비 */
@@ -412,6 +434,18 @@ static void AswAuto_HandleArcTurn(uint32_t dist_left, uint32_t dist_front, uint3
     AswAuto_DriveArc(s_turnDir);
 }
 
+/* 이번 피벗이 시작될 때의 헤딩 대비 현재 헤딩의 차이를 (-180, 180] 구간으로
+ * 정규화한다. fmodf를 일부러 쓰지 않는데, 이 코드베이스는 ASW 계층에서 작은
+ * 루프로 같은 일을 할 수 있으면 libm 의존을 만들지 않는 관례를 따르기 때문이다
+ * (asw_manual_control.c의 ClampF/AbsF가 같은 이유로 직접 만들어져 있다). */
+static float AswAuto_PivotYawDeltaDeg(void)
+{
+    float delta = ASW_ImuAttitude_GetYawDeg() - s_pivotYawStartDeg;
+    while (delta > 180.0f)  { delta -= 360.0f; }
+    while (delta < -180.0f) { delta += 360.0f; }
+    return delta;
+}
+
 /* ------------------------------------------------------------------------
  * PIVOT 상태 처리 : 비상 제자리 피벗 (연속 회전)
  * ------------------------------------------------------------------------ */
@@ -440,12 +474,41 @@ static void AswAuto_HandlePivot(uint32_t dist_front)
         return;
     }
 
-    /* 과회전(U턴) 방지 : 예상 회전시간을 넘기고도 EXIT_CM 조건을 못 채웠다면
+    /* 과회전(U턴) 방지 : 예상 회전량을 넘기고도 EXIT_CM 조건을 못 채웠다면
      * 그 이상 계속 돌면 왔던 길(반대편)까지 만나 U턴할 위험이 크므로,
      * 더 느슨한 기준(WARNING_CM)만 만족해도 즉시 복귀시킨다.
-     * (자이로가 없어 정확한 각도 측정은 불가 - EXPECT_MS는 경험적 추정치이며
-     *  실제 회전 속도(PIVOT_DUTY)에 따라 실측 보정이 필요할 수 있다) */
-    if (s_turnElapsedMs >= ASW_AUTO_PIVOT_EXPECT_MS && dist_front > ASW_AUTO_DIST_WARNING_CM)
+     * (이제는 자이로가 있다 - remote IMU yaw가 CAN 0x120으로 올라오므로 실제로
+     *  얼마나 돌았는지를 재서 EXPECT_DEG로 판정한다. 다만 부팅 직후 캘리브레이션
+     *  중이거나 CAN 링크가 아직 안 올라와 신뢰할 각도가 없을 수 있으므로, 기존
+     *  시간 추정(EXPECT_MS)을 그대로 폴백으로 남겨 둔다. 각도를 못 믿는다고
+     *  과회전 가드 자체가 사라지면 안 되기 때문 - 페일세이프는 항상 동작한다) */
+    uint8_t shouldForceExit = 0u;
+    /* 분기 기준은 "지금" IsValid()가 아니라 피벗 진입 때 찍어 둔 s_pivotYawValid다.
+     * 피벗이 IsValid()==false 인 상태에서 시작하면 s_pivotYawStartDeg에는 의미 없는
+     * 0.0f가 박힌다. 그 뒤 피벗 도중에 첫 캘리브레이션 프레임이 도착하면, 살아있는
+     * 검사를 쓸 경우 가드가 각도 분기로 넘어가면서 그 쓰레기 기준값에 대해 델타를
+     * 계산한다 - 실제 yaw 140도가 기준 0도와 비교되어 turnedAbsDeg = 140 >= 90이 되고,
+     * 거의 돌지도 않은 차에서 과회전 탈출이 잘못 발동한다. 진입 시점 스냅샷으로
+     * 분기하면 한 번의 피벗은 처음부터 끝까지 하나의 가드 모드만 쓴다: 기준값을
+     * 실제로 믿을 수 있을 때만 각도 기반, 아니면 시간 기반. IsValid()는 절대 풀리지
+     * 않으므로 false->true 전이만 가능하고, 이 분기가 정확히 그 경우를 막는다. */
+    if (s_pivotYawValid != 0u)
+    {
+        /* 부호는 보지 않고 크기만 쓴다 - 좌/우 피벗 어느 쪽이든 "얼마나 돌았나"만
+         * 필요하므로 IMU의 yaw 부호 규약에 의존하지 않는다 */
+        float turnedDeg    = AswAuto_PivotYawDeltaDeg();
+        float turnedAbsDeg = (turnedDeg < 0.0f) ? -turnedDeg : turnedDeg;
+        if (turnedAbsDeg >= ASW_AUTO_PIVOT_EXPECT_DEG && dist_front > ASW_AUTO_DIST_WARNING_CM)
+        {
+            shouldForceExit = 1u;
+        }
+    }
+    else if (s_turnElapsedMs >= ASW_AUTO_PIVOT_EXPECT_MS && dist_front > ASW_AUTO_DIST_WARNING_CM)
+    {
+        shouldForceExit = 1u;
+    }
+
+    if (shouldForceExit != 0u)
     {
         /* 위와 동일한 이유로 정지 완충 후 다음 주기에 전진 복귀 */
         RTE_Motor_Stop();
