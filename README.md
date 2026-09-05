@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🚗 STM32F103 자율주행 RC카 : CAN 기반 2-노드 분산 제어 시스템
+# 🚗 STM32F103 자율주행 RC카 : CAN 기반 분산형 제어 시스템
 
 ### Ultrasonic Maze-Solving Vehicle + 9-Axis IMU Remote Node over CAN (Solo Project)
 
