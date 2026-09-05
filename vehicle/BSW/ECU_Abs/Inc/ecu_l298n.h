@@ -56,6 +56,10 @@ void ECU_L298N_SetSpeed(uint32_t left_duty, uint32_t right_duty);
  * 두 채널 모두 전진 방향이며 속도차만 두므로 급격한 회전은 발생하지 않음. */
 void ECU_L298N_DriveForwardDifferential(uint16_t leftDuty, uint16_t rightDuty);
 
+/* 좌/우 바퀴에 서로 다른 duty로 "후진" (전진용 차등 조향의 후진 버전).
+ * 두 채널 모두 후진 방향이며 속도차만 두므로 급격한 회전은 발생하지 않음. */
+void ECU_L298N_DriveBackwardDifferential(uint16_t leftDuty, uint16_t rightDuty);
+
 /* 진짜 제자리 피벗 회전: 한쪽 바퀴는 전진, 반대쪽 바퀴는 후진으로 구동하여
  * 차체가 코너 쪽으로 전진하며 쓸리지 않고 그 자리에서 회전하도록 함. */
 void ECU_L298N_PivotLeft(uint32_t duty);

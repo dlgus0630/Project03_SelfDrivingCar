@@ -25,6 +25,7 @@ void     RTE_Motor_TurnRight(uint32_t duty);
 void     RTE_Motor_Stop(void);
 void     RTE_Motor_Brake(void);
 void     RTE_Motor_DriveForwardDifferential(uint16_t leftDuty, uint16_t rightDuty);
+void     RTE_Motor_DriveBackwardDifferential(uint16_t leftDuty, uint16_t rightDuty);
 void     RTE_Motor_PivotLeft(uint32_t duty);
 void     RTE_Motor_PivotRight(uint32_t duty);
 

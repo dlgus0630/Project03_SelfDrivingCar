@@ -25,15 +25,15 @@
 
 /* ------------------------------------------------------------------------
  * CAN ID 정의 (Communication Matrix 확정본)
- *   0x100 ~ 0x1FF : Node1 (NUCLEO, Master)     -> 전체 Broadcast
- *   0x200 ~ 0x2FF : Node2 (STM32, 본 슬레이브) -> 상태/응답
- *   0x3F0         : Node2 전용 생존 신호(Heartbeat) 송신 ID
+ *   0x100 ~ 0x1FF : remote 노드 (Master)       -> 전체 Broadcast
+ *   0x200 ~ 0x2FF : vehicle 노드 (본 노드)     -> 상태/응답
+ *   0x3F0         : vehicle 노드 전용 생존 신호(Heartbeat) 송신 ID
  * ------------------------------------------------------------------------ */
-#define MCAL_CAN_ID_MASTER_MODE_CMD      0x100u  /* 수동/자동 모드 전환 */
-#define MCAL_CAN_ID_MASTER_MANUAL_CMD    0x110u  /* 수동 조향/속도 명령 */
+#define MCAL_CAN_ID_REMOTE_MODE_CMD      0x100u  /* 수동/자동 모드 전환 */
+#define MCAL_CAN_ID_REMOTE_MANUAL_CMD    0x110u  /* 수동 조향/속도 명령 */
 #define MCAL_CAN_ID_REMOTE_IMU_ATTITUDE  0x120u  /* remote 노드 IMU roll/pitch (0.1도 단위) */
-#define MCAL_CAN_ID_SLAVE_STATUS         0x200u  /* 슬레이브 상태/거리값 응답 */
-#define MCAL_CAN_ID_SLAVE_HEARTBEAT      0x3F0u  /* 본 노드 생존 신호 */
+#define MCAL_CAN_ID_VEHICLE_STATUS       0x200u  /* 본 노드 상태/거리값 응답 */
+#define MCAL_CAN_ID_VEHICLE_HEARTBEAT    0x3F0u  /* 본 노드 생존 신호 */
 
 #define MCAL_CAN_RX_QUEUE_LEN            8u
 #define MCAL_CAN_DLC_MAX                 8u
@@ -67,6 +67,17 @@ void     MCAL_CAN_BroadcastSlaveStatus(McalCanSlaveState_t state,
                                     uint32_t dist_left,
                                     uint32_t dist_front,
                                     uint32_t dist_right);
+
+/* HEARTBEAT(0x3F0) 생존 신호 송신 헬퍼. CanTxTask에서 약 1초 주기로 호출.
+ * healthBits는 1바이트 비트필드이며, 각 비트의 의미는 아래와 같다.
+ *   bit0 : CAN 셀이 버스오프 복구에 실패해 막혀 있음 (g_vdiag_can_stuck)
+ *   bit1 : CAN 오류 수동(Error Passive) 상태  (g_vdiag_can_epvf)
+ *   bit2 : CAN 오류 경고(Error Warning) 상태  (g_vdiag_can_ewgf)
+ *   bit3 : CAN 수신 인터럽트가 켜져 있지 않음 (g_vdiag_can_notify_ok == 0)
+ *   bit4 : 제어 루프(CtrlTask)가 멈춤 - 생존 카운터가 지난 주기 이후 안 늘어남
+ *   bit5~7 : 예약(항상 0)
+ * 0이면 "모든 항목 정상"을 뜻한다. */
+void     MCAL_CAN_BroadcastHeartbeat(uint8_t healthBits);
 
 /* HAL_CAN_RxFifo0MsgPendingCallback (ISR Context) 에서 호출 */
 void     MCAL_CAN_HandleRxFifoIsr(CAN_HandleTypeDef *p_hcan);

@@ -210,6 +210,9 @@ void StartCtrlTask(void const * argument)
 
   for(;;)
   {
+    /* 제어 루프가 살아서 한 주기를 돌고 있음을 증명 (CanTxTask가 HEARTBEAT에 반영) */
+    g_ctrl_loop_alive_counter++;
+
     uint32_t left  = RTE_Sensor_GetDistance(ECU_HCSR04_SENSOR_LEFT);
     uint32_t front = RTE_Sensor_GetDistance(ECU_HCSR04_SENSOR_FRONT);
     uint32_t right = RTE_Sensor_GetDistance(ECU_HCSR04_SENSOR_RIGHT);
@@ -278,6 +281,140 @@ void StartCanRxTask(void const * argument)
   /* USER CODE END StartCanRxTask */
 }
 
+/* ---- 버스오프 자동 복구 (진단용 임시 코드가 아니라 정식 기능) ----
+ * 이 보드는 CubeMX 설정에서 AutoBusOff가 DISABLE(꺼짐)로 되어 있다.
+ * AutoBusOff가 켜져 있으면 버스오프에 빠졌을 때 하드웨어가 알아서 복구
+ * 절차를 밟지만, 꺼져 있으면 CAN 컨트롤러는 버스오프 상태에 그대로
+ * 눌러앉아 영원히 한 프레임도 내보내지 않는다. 즉 상대 노드가 꺼져 있는
+ * 동안 혼자 송신하다 한 번 버스오프로 떨어지면, 나중에 상대 노드를 켜도
+ * 이쪽은 영영 조용한 채로 남는다. 그래서 소프트웨어가 버스오프를 직접
+ * 감지해 CAN을 껐다 켜서 되살려 주어야 한다.
+ * (.ioc 설정은 건드리지 않는 것이 요구사항이므로 이 소프트웨어 복구
+ *  로직을 정식으로 남겨 둔다.)
+ *
+ * 재시도는 절대 포기하지 않는다. 지금 복구가 막혀 있으면
+ * g_vdiag_can_stuck을 1로 올려 두되(영구 래치가 아닌 현재 상태 플래그),
+ * 다음 주기에도 계속 시도하며 복구에 성공하는 순간 다시 0으로 내린다.
+ *
+ * @retval 0 : 버스오프가 아니거나 이번 주기에 할 일 없음(재시도 간격 대기)
+ * @retval 1 : 이번 호출에서 복구 성공
+ * @retval 2 : 시도했으나 실패 (g_vdiag_can_stuck = 1)
+ */
+/* keep this function's logic in sync with remote/Core/Src/freertos.c's equivalent recovery helper
+ * the busOffRetryTick throttle exists only because StartCanTxTask calls this every 100ms while remote's
+ * StartDefaultTask already paces at ~1s via osDelay(1000); apart from that the logic must stay identical. */
+static uint8_t Can_TryBusOffRecover(void)
+{
+  /* 버스오프 복구 재시도 간격을 제한하기 위한 주기 카운터.
+   * CanTxTask가 100ms 주기로 이 함수를 호출하므로 10주기 = 약 1초에 한 번만
+   * 실제 복구를 시도한다. (static이라 호출 사이에 값이 유지된다)
+   *
+   * 간격을 두는 이유:
+   *  1) HAL_CAN_Stop()은 CAN을 초기화 모드로 넣으면서 대기 중이던 송신
+   *     메일박스를 전부 취소해 버린다. 100ms마다 Stop/Start를 반복하면
+   *     정상 복구된 뒤에도 송신이 계속 끊겨 오히려 통신이 더 나빠진다.
+   *  2) CAN 규격상 버스오프에서 빠져나오려면 "연속 11비트 리세시브"를
+   *     128번 관측해야 한다. 상대 노드가 아직 안 켜져 있으면 복구 직후
+   *     곧바로 다시 버스오프로 떨어지므로, 더 자주 시도해봐야 소용없다.
+   *     1초 간격이면 상대 노드가 살아나는 즉시 늦어도 1초 안에 다시 붙는다.
+   *  3) 복구 성공이 1초에 최대 1번만 집계되므로, Live Expressions에서
+   *     g_vdiag_can_recover_cnt를 "지금까지 되살아난 횟수"로 읽을 수 있다.
+   *     (버스가 붙었다 끊겼다를 반복하는 동안에는 초당 1씩 늘어난다.
+   *      반대로 복구가 계속 실패하는 동안에는 값이 멈춰 있으므로, 이 값을
+   *      '버스오프였던 시간'으로 읽어서는 안 된다.) */
+  static uint32_t busOffRetryTick = 0u;
+
+  HAL_StatusTypeDef stopStatus;
+  HAL_StatusTypeDef startStatus;
+  HAL_StatusTypeDef notifyStatus;
+  uint8_t attemptNow;
+
+  if (g_vdiag_can_boff == 0u)
+  {
+    /* 정상 상태로 돌아왔으면 다음 버스오프 때 곧바로 복구할 수 있도록
+     * 재시도 카운터를 초기화해 둔다. */
+    busOffRetryTick = 0u;
+    return 0u;
+  }
+
+  attemptNow = (busOffRetryTick == 0u) ? 1u : 0u;
+
+  busOffRetryTick++;
+  if (busOffRetryTick >= 10u)   /* 100ms * 10 = 약 1초마다 재시도 */
+  {
+    busOffRetryTick = 0u;
+  }
+
+  if (attemptNow == 0u)
+  {
+    return 0u;   /* 재시도 간격에 걸림: 이번 주기는 아무것도 건드리지 않는다 */
+  }
+
+  /* 상태 조건을 "먼저" 확인한다. 실제로 시도할 수 있는 전이일 때만 수신
+   * 인터럽트를 껐다 켠다. HAL_CAN_Stop()은 State가 LISTENING일 때만 성공하고,
+   * 다른 상태(특히 이전 시도가 타임아웃되어 굳어버린 HAL_CAN_STATE_ERROR)에서는
+   * 내부 가드에 막혀 아무 일도 하지 않고 HAL_ERROR만 돌려준다. 그런 상황에서
+   * 인터럽트만 껐다 켜는 것은 얻는 것 없이 수신만 흔드는 짓이므로,
+   * 시도조차 못 하는 경우에는 인터럽트를 전혀 건드리지 않고 바로 빠져나온다. */
+  if (hcan.State != HAL_CAN_STATE_LISTENING)
+  {
+    /* 인터럽트는 위 설명대로 전혀 건드리지 않지만, 진단 플래그는 갱신해 둔다.
+     * 이 함수의 실패가 아니라 바깥의 다른 원인으로 CAN 상태가 망가진 경우,
+     * 플래그는 마지막에 기록된 값(대개 "정상")에 영원히 멈춰 있게 되고
+     * 그러면 HEARTBEAT bit3이 계속 거짓 정보를 내보낸다. State가 LISTENING
+     * 조차 아니라면 수신이 정상 상태라고 볼 근거가 없으므로 0으로 내린다. */
+    g_vdiag_can_stuck = 1u;
+    g_vdiag_can_notify_ok = 0u;
+    return 2u;
+  }
+
+  /* Stop/Start 전에 수신 인터럽트를 먼저 꺼 둔다.
+   * 이 과정에서 CAN 셀은 초기화 모드로 들어갔다 나오는데, 그 도중에
+   * HAL_CAN_RxFifo0MsgPendingCallback()이 끼어들면 재설정 중인 같은 hcan
+   * 핸들을 동시에 건드리게 된다.
+   * HAL_CAN_Stop()은 인터럽트 설정을 건드리지 않으므로 직접 꺼야 한다. */
+  (void)HAL_CAN_DeactivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+
+  /* 반환값을 따지지 않고 무조건 플래그를 내린다. "수신 인터럽트를 꺼 달라"고
+   * 요청한 순간부터는 그 호출이 성공했든 실패했든 수신이 정상 상태라고 볼 수
+   * 없기 때문이다. 어차피 함수 끝에서 ActivateNotification 결과로 다시 세팅된다. */
+  g_vdiag_can_notify_ok = 0u;
+
+  /* Stop -> Start 로 CAN 셀을 초기화 모드에 넣었다 빼면서 버스오프 복구
+   * 시퀀스를 다시 시작시킨다. */
+  stopStatus = HAL_CAN_Stop(&hcan);
+
+  /* HAL_CAN_Start()는 State가 READY일 때만 성공한다.
+   * Stop이 정상적으로 끝나야 READY가 되므로 두 조건을 함께 확인한다. */
+  if ((stopStatus == HAL_OK) && (hcan.State == HAL_CAN_STATE_READY))
+  {
+    startStatus = HAL_CAN_Start(&hcan);
+  }
+  else
+  {
+    startStatus = HAL_ERROR;
+  }
+
+  /* 성공/실패 어느 쪽이든, 우리가 껐던 수신 인터럽트는 반드시 다시 켜서
+   * 영구히 꺼진 채로 남지 않게 한다. 셀이 HAL_CAN_STATE_ERROR로 굳었다면
+   * 이 호출도 같은 내부 가드에 막혀 HAL_ERROR를 돌려주는데, 그 결과를
+   * 버리지 않고 진단 플래그에 그대로 반영해 둔다. */
+  notifyStatus = HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+  g_vdiag_can_notify_ok = (uint8_t)((notifyStatus == HAL_OK) ? 1u : 0u);
+
+  if ((stopStatus == HAL_OK) && (startStatus == HAL_OK))
+  {
+    /* 시퀀스 전체가 성공했을 때만 복구로 인정하고 센다. */
+    g_vdiag_can_stuck = 0u;
+    g_vdiag_can_recover_cnt++;
+    return 1u;
+  }
+
+  /* 이번 시도는 실패. 다음 주기에도 계속 재시도한다(포기하지 않는다). */
+  g_vdiag_can_stuck = 1u;
+  return 2u;
+}
+
 /* USER CODE BEGIN Header_StartCanTxTask */
 /**
 * @brief 100ms 주기로 현재 주행모드와 거리값을 SLAVE_STATUS(0x200)로 브로드캐스트.
@@ -288,28 +425,18 @@ void StartCanRxTask(void const * argument)
 void StartCanTxTask(void const * argument)
 {
   /* USER CODE BEGIN StartCanTxTask */
-  /* 버스오프 복구 재시도 간격을 제한하기 위한 주기 카운터.
-   * 이 태스크는 100ms 주기이므로 10주기 = 약 1초에 한 번만 복구를 시도한다.
-   *
-   * 간격을 두는 이유:
-   *  1) HAL_CAN_Stop()은 CAN을 초기화 모드로 넣으면서 대기 중이던 송신
-   *     메일박스를 전부 취소해 버린다. 100ms마다 Stop/Start를 반복하면
-   *     정상 복구된 뒤에도 송신이 계속 끊겨 오히려 통신이 더 나빠진다.
-   *  2) CAN 규격상 버스오프에서 빠져나오려면 "연속 11비트 리세시브"를
-   *     128번 관측해야 한다. 상대 노드가 아직 안 켜져 있으면 복구 직후
-   *     곧바로 다시 버스오프로 떨어지므로, 무한정 재시도해봐야 소용없다.
-   *     1초 간격이면 상대 노드가 살아나는 즉시 늦어도 1초 안에 다시 붙는다.
-   *  3) 복구 시도 횟수가 1초에 1씩만 늘어나므로, Live Expressions에서
-   *     g_vdiag_can_recover_cnt 값을 "버스오프였던 시간(초)"으로 바로
-   *     읽을 수 있다. */
-  uint32_t busOffRetryTick = 0u;
-
   /* HEARTBEAT(0x3F0) 송신 주기 카운터.
    * 이 태스크는 100ms 주기이므로 10주기 = 약 1초에 한 번만 생존 신호를 보낸다.
    * 상태(0x200)는 100ms마다 나가지만, 생존 신호까지 같은 주기로 내보내면
    * 송신 메일박스(3개)와 버스 대역만 낭비된다. 마스터 입장에서 "이 노드가
    * 살아 있는가"는 1초 해상도면 충분하다. */
   uint32_t heartbeatTick = 0u;
+
+  /* 직전 HEARTBEAT 때 읽어 둔 제어 루프 생존 카운터 값.
+   * 이 태스크는 절대 반환하지 않으므로 지역변수만으로도 주기 사이에 값이
+   * 유지된다(static 불필요). 다음 HEARTBEAT 때 값이 그대로면 CtrlTask가
+   * 멈춘 것으로 판정한다. */
+  uint32_t lastCtrlAliveSnapshot = 0u;
 
   for(;;)
   {
@@ -337,115 +464,71 @@ void StartCanTxTask(void const * argument)
     g_vdiag_can_epvf = (uint8_t)(((esr & CAN_ESR_EPVF) != 0u) ? 1u : 0u);
     g_vdiag_can_ewgf = (uint8_t)(((esr & CAN_ESR_EWGF) != 0u) ? 1u : 0u);
 
-    /* ---- 버스오프 자동 복구 (진단용 임시 코드가 아니라 정식 기능) ----
-     * 이 보드는 CubeMX 설정에서 AutoBusOff가 DISABLE(꺼짐)로 되어 있다.
-     * AutoBusOff가 켜져 있으면 버스오프에 빠졌을 때 하드웨어가 알아서
-     * 복구 절차를 밟지만, 꺼져 있으면 CAN 컨트롤러는 버스오프 상태에
-     * 그대로 눌러앉아 영원히 한 프레임도 내보내지 않는다.
-     * 즉 상대 노드가 꺼져 있는 동안 혼자 송신하다 한 번 버스오프로
-     * 떨어지면, 나중에 상대 노드를 켜도 이쪽은 영영 조용한 채로 남는다.
-     * 그래서 소프트웨어가 버스오프를 직접 감지해 CAN을 껐다 켜서
-     * 되살려 주어야 한다. (.ioc 설정은 건드리지 않는 것이 요구사항이므로
-     * 이 소프트웨어 복구 로직을 정식으로 남겨 둔다.) */
-    if (g_vdiag_can_boff != 0u)
-    {
-      if ((busOffRetryTick == 0u) && (g_vdiag_can_unrecoverable == 0u))
-      {
-        HAL_StatusTypeDef stopStatus;
-        HAL_StatusTypeDef startStatus;
-
-        /* Stop/Start 전에 수신 인터럽트를 먼저 꺼 둔다.
-         * 이 과정에서 CAN 셀은 초기화 모드로 들어갔다 나오는데, 그 도중에
-         * HAL_CAN_RxFifo0MsgPendingCallback()이 끼어들면 재설정 중인
-         * 같은 hcan 핸들을 동시에 건드리게 된다.
-         * HAL_CAN_Stop()은 인터럽트 설정을 건드리지 않으므로 직접 꺼야 한다. */
-        (void)HAL_CAN_DeactivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
-
-        /* Stop -> Start 로 CAN 셀을 초기화 모드에 넣었다 빼면서
-         * 버스오프 복구 시퀀스를 다시 시작시킨다.
-         * HAL_CAN_Stop()은 State가 LISTENING일 때만 성공한다. 다른 상태
-         * (특히 이전 시도가 타임아웃되어 굳어버린 HAL_CAN_STATE_ERROR)에서는
-         * 내부 가드에 막혀 아무 일도 하지 않고 HAL_ERROR만 돌려주므로,
-         * 조건을 미리 확인해 헛된 호출을 피한다. */
-        if (hcan.State == HAL_CAN_STATE_LISTENING)
-        {
-          stopStatus = HAL_CAN_Stop(&hcan);
-        }
-        else
-        {
-          stopStatus = HAL_ERROR;
-        }
-
-        /* HAL_CAN_Start()는 State가 READY일 때만 성공한다.
-         * Stop이 정상적으로 끝나야 READY가 되므로 두 조건을 함께 확인한다. */
-        if ((stopStatus == HAL_OK) && (hcan.State == HAL_CAN_STATE_READY))
-        {
-          startStatus = HAL_CAN_Start(&hcan);
-        }
-        else
-        {
-          startStatus = HAL_ERROR;
-        }
-
-        if ((stopStatus == HAL_OK) && (startStatus == HAL_OK))
-        {
-          /* 재시작이 실제로 끝난 뒤에야 수신 인터럽트를 다시 켠다. */
-          (void)HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
-
-          /* 시퀀스 전체가 성공했을 때만 센다. 그래야 이 값을 원래 의도대로
-           * "버스오프였던 시간(초)"으로 읽을 수 있다. */
-          g_vdiag_can_recover_cnt++;
-        }
-        else
-        {
-          /* 실패 경로에서도 수신 인터럽트를 다시 켜 두어, 우리가 끈 인터럽트가
-           * 영구히 꺼진 채로 남지 않게 한다. 다만 셀이 HAL_CAN_STATE_ERROR로
-           * 굳었다면 HAL_CAN_ActivateNotification()도 같은 내부 가드에 막혀
-           * HAL_ERROR를 돌려준다. 그 경우엔 어차피 CAN 셀 자체가 죽어 있어
-           * 수신도 불가능하므로 이로 인해 잃는 기능은 없다. */
-          (void)HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
-
-          /* Stop/Start가 타임아웃되면 State가 HAL_CAN_STATE_ERROR로 굳어버려,
-           * 이후 같은 Stop/Start를 아무리 반복해도 내부 가드에 막혀 전부
-           * 무의미한 호출이 된다. MCU 리셋 없이는 복구가 불가능하므로
-           * 재시도를 의도적으로 포기하고 플래그를 래치해 둔다.
-           * (정상 경로에서 이 플래그를 자동으로 지우지 않는 이유도 이것이다.) */
-          g_vdiag_can_unrecoverable = 1u;
-        }
-      }
-
-      busOffRetryTick++;
-      if (busOffRetryTick >= 10u)   /* 100ms * 10 = 약 1초마다 재시도 */
-      {
-        busOffRetryTick = 0u;
-      }
-    }
-    else
-    {
-      /* 정상 상태로 돌아왔으면 다음 버스오프 때 곧바로 복구할 수 있도록
-       * 재시도 카운터를 초기화해 둔다. */
-      busOffRetryTick = 0u;
-    }
+    /* ---- 버스오프 자동 복구 ----
+     * 실제 복구 로직과 재시도 간격 제한은 Can_TryBusOffRecover()가 전담한다.
+     * 결과는 g_vdiag_can_stuck / g_vdiag_can_recover_cnt 전역에 반영되고,
+     * 바로 아래 HEARTBEAT가 그 값을 그대로 실어 보내므로 반환값은 쓰지 않는다. */
+    (void)Can_TryBusOffRecover();
 
     /* ---- HEARTBEAT(0x3F0) 약 1초 주기 송신 ----
-     * DLC 1바이트짜리 최소 프레임으로 "이 노드가 아직 돌고 있다"를 알린다.
-     * payload[0] : 0 = 정상, 1 = CAN 셀이 복구 불가능 상태로 굳음.
+     * DLC 1바이트짜리 최소 프레임으로 "이 노드가 아직 제대로 돌고 있다"를 알린다.
+     * payload[0]은 비트필드이며 각 비트의 의미는 아래와 같다 (0 = 전부 정상).
+     *   bit0 : 버스오프 복구가 막혀 있음        (g_vdiag_can_stuck)
+     *   bit1 : CAN 오류 수동(Error Passive)     (g_vdiag_can_epvf)
+     *   bit2 : CAN 오류 경고(Error Warning)     (g_vdiag_can_ewgf)
+     *   bit3 : CAN 수신 인터럽트가 꺼져 있음    (g_vdiag_can_notify_ok == 0)
+     *   bit4 : 제어 루프(CtrlTask)가 멈춤
+     *   bit5~7 : 예약(항상 0)
      *
-     * 위 버스오프 복구 블록이 끝난 뒤에 보내는 이유는, 이번 주기에서 복구를
-     * 시도하다 실패해 g_vdiag_can_unrecoverable이 막 1로 래치된 경우까지
-     * 같은 주기 안에서 곧바로 반영해 내보내기 위해서다.
+     * bit4가 핵심이다. 이 태스크(CanTxTask)는 우선순위가 가장 낮아서, 이 프레임이
+     * 나갔다는 사실만으로는 "CanTxTask가 스케줄됐다"는 것밖에 증명하지 못한다.
+     * 실제로 센서를 읽고 위험하면 모터를 세우는 것은 50ms 주기의 CtrlTask이므로,
+     * CtrlTask가 매 주기 올리는 생존 카운터가 지난 HEARTBEAT 이후로 늘었는지를
+     * 함께 확인한다. 카운터가 그대로면 제어 루프가 멈춘 것이고, 그때 모터는
+     * 마지막 명령 듀티로 계속 돌고 있으므로 마스터가 반드시 알아야 한다.
+     *
+     * 위 버스오프 복구 블록이 끝난 뒤에 보내는 이유는, 이번 주기에 복구를
+     * 시도하다 실패해 g_vdiag_can_stuck이 막 1이 된 경우까지 같은 주기 안에서
+     * 곧바로 반영해 내보내기 위해서다.
      *
      * 물론 CAN 셀이 정말 죽었다면 이 프레임 자체가 버스로 나가지 못한다.
-     * 그때는 마스터가 "1이라고 알려오는 것"이 아니라 "생존 신호가 끊긴 것"
-     * 으로 고장을 판정하게 된다. payload[0]=1은 셀이 아직 송신은 되지만
-     * 복구를 포기한 어중간한 상태를 구분해 주는 용도다. */
+     * 그때는 마스터가 "비트가 1이라고 알려오는 것"이 아니라 "생존 신호가 끊긴 것"
+     * 으로 고장을 판정하게 된다. 이 비트필드는 셀이 아직 송신은 되는 상태에서
+     * 어디가 어떻게 나쁜지를 구분해 주는 용도다. */
     heartbeatTick++;
     if (heartbeatTick >= 10u)   /* 100ms * 10 = 약 1초 */
     {
-      uint8_t hbPayload[1];
+      uint32_t ctrlAliveNow = g_ctrl_loop_alive_counter;
+      uint8_t  healthBits   = 0u;
 
-      hbPayload[0] = (g_vdiag_can_unrecoverable != 0u) ? 1u : 0u;
-      (void)MCAL_CAN_Transmit(MCAL_CAN_ID_SLAVE_HEARTBEAT, hbPayload, 1u);
+      if (g_vdiag_can_stuck != 0u)
+      {
+        healthBits |= 0x01u;
+      }
+      if (g_vdiag_can_epvf != 0u)
+      {
+        healthBits |= 0x02u;
+      }
+      if (g_vdiag_can_ewgf != 0u)
+      {
+        healthBits |= 0x04u;
+      }
+      if (g_vdiag_can_notify_ok == 0u)
+      {
+        healthBits |= 0x08u;
+      }
+      if (ctrlAliveNow == lastCtrlAliveSnapshot)
+      {
+        /* 지난 HEARTBEAT 이후 제어 루프가 한 주기도 못 돌았다는 뜻.
+         * (부팅 직후에도 CtrlTask가 첫 HEARTBEAT보다 먼저 돌기 시작하므로
+         *  카운터는 이미 0이 아니다. 만에 하나 아직 0이라면 그것 역시
+         *  "제어 루프가 아직 안 돌고 있다"는 사실 그대로의 보고다.) */
+        healthBits |= 0x10u;
+      }
+
+      lastCtrlAliveSnapshot = ctrlAliveNow;
+
+      MCAL_CAN_BroadcastHeartbeat(healthBits);
 
       heartbeatTick = 0u;
     }

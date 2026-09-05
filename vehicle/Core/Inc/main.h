@@ -67,7 +67,12 @@ extern volatile uint32_t g_vdiag_can_tx_ok;
 extern volatile uint32_t g_vdiag_can_tx_fail;
 extern volatile uint32_t g_vdiag_can_free_mb;
 extern volatile uint32_t g_vdiag_can_recover_cnt;
-extern volatile uint8_t  g_vdiag_can_unrecoverable;
+extern volatile uint8_t  g_vdiag_can_stuck;
+extern volatile uint8_t  g_vdiag_can_notify_ok;
+
+/* 제어 루프(CtrlTask) 생존 카운터. CtrlTask가 매 주기 증가시키고,
+ * CanTxTask가 HEARTBEAT 송신 시 증가 여부를 확인한다. */
+extern volatile uint32_t g_ctrl_loop_alive_counter;
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

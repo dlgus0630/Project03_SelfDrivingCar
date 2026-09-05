@@ -37,6 +37,11 @@ void MCAL_CAN_Init(void)
     {
         Error_Handler();
     }
+
+    /* [진단] 수신 인터럽트가 실제로 켜졌음을 기록한다. 이 줄까지 도달했다는 것은
+     * 위 활성화가 성공했다는 뜻이다(실패하면 Error_Handler()에서 멈춘다).
+     * 부팅 직후에도 이 플래그가 0(=고장)으로 잘못 읽히지 않도록 여기서 세운다. */
+    g_vdiag_can_notify_ok = 1u;
 }
 
 /* ------------------------------------------------------------------------
@@ -132,7 +137,22 @@ void MCAL_CAN_BroadcastSlaveStatus(McalCanSlaveState_t state,
     payload[4] = s_heartbeatCounter++;   /* Rolling Counter */
     payload[5] = 0u;                     /* Fault Flags (추후 확장) */
 
-    (void)MCAL_CAN_Transmit(MCAL_CAN_ID_SLAVE_STATUS, payload, 8u);
+    (void)MCAL_CAN_Transmit(MCAL_CAN_ID_VEHICLE_STATUS, payload, 8u);
+}
+
+/* ------------------------------------------------------------------------
+ * MCAL_CAN_BroadcastHeartbeat : HEARTBEAT(0x3F0) 생존 신호 송신 헬퍼
+ *   CanTxTask에서 약 1초 주기로 호출
+ *   healthBits 각 비트의 의미는 mcal_can.h의 프로토타입 주석 참조.
+ *   (0 = 모든 항목 정상)
+ * ------------------------------------------------------------------------ */
+void MCAL_CAN_BroadcastHeartbeat(uint8_t healthBits)
+{
+    uint8_t payload[1] = {0};
+
+    payload[0] = healthBits;
+
+    (void)MCAL_CAN_Transmit(MCAL_CAN_ID_VEHICLE_HEARTBEAT, payload, 1u);
 }
 
 /* ------------------------------------------------------------------------

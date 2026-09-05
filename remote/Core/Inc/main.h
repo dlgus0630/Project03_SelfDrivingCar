@@ -102,7 +102,7 @@ extern volatile uint32_t g_diag_can_esr_raw;     /* ESR 레지스터 원본값 *
 extern volatile uint32_t g_diag_can_hal_err;     /* HAL_CAN_GetError() 반환값 */
 extern volatile uint8_t  g_diag_can_loopback;    /* 루프백 결과 (0/1/2/3/4) */
 extern volatile uint8_t  g_diag_can_restore_ok;  /* 정상 모드 복귀 성공 시 1 */
-extern volatile uint32_t g_diag_can_recover_cnt; /* 버스오프 복구 시도 횟수 */
+extern volatile uint32_t g_diag_can_recover_cnt; /* 버스오프 복구에 성공한 횟수 */
 extern volatile uint8_t  g_diag_can_stuck;       /* 리셋 없이는 복구 불가 상태면 1 */
 /* USER CODE END EFP */
 

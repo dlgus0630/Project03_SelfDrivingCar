@@ -3,7 +3,7 @@
  *  Layer  : ASW
  *  Module : ASW_MANUAL_CONTROL
  *
- *  Node1(NUCLEO)이 블루투스로 수신한 조향/속도 명령을 CAN(0x110)으로
+ *  remote 노드가 블루투스로 수신한 조향/속도 명령을 CAN(0x110)으로
  *  전달받거나, 휴대폰 BT 앱의 단일문자 명령을 시리얼로 직접 받아 모터를 구동.
  *  여기에 더해 remote 노드가 CAN(0x120)으로 보내는 IMU 기울기(roll/pitch)를
  *  좌/우 차등 PWM으로 변환해 주행하는 세 번째 명령 출처도 지원한다.
@@ -30,6 +30,7 @@
 #define ASW_IMU_MAX_TILT_DEG   30.0f  /* 이 각도에서 최대 duty에 도달 */
 #define ASW_IMU_MIN_DUTY       300u   /* 데드존을 막 벗어난 순간의 기동 duty */
 #define ASW_IMU_MAX_DUTY       ECU_L298N_MAX_DUTY   /* 하드코딩 금지: L298N 헤더의 최대 duty와 항상 동기화 */
+#define ASW_IMU_DUTY_SPAN      ((float)(ASW_IMU_MAX_DUTY - ASW_IMU_MIN_DUTY)) /* 기울기 비율을 곱할 duty 가동 폭 */
 
 typedef enum
 {
@@ -43,22 +44,33 @@ static volatile uint8_t  s_lastCmd    = 'S';
 static volatile uint32_t s_lastRxTick = 0;
 static volatile AswManualCmdSource_t s_cmdSource = ASW_MANUAL_CMD_SOURCE_NONE;
 
-/* IMU 출처일 때 적용할 좌/우 duty와 진행 방향.
- * 계산된 duty는 "크기"만 담고 부호가 없으므로, 실제로 모터에 적용하는 쪽에서
- * 전진인지 후진인지 알 수 없다. 그래서 방향을 s_imuReverse로 따로 들고 간다. */
-static volatile uint16_t s_imuLeftDuty  = 0;
-static volatile uint16_t s_imuRightDuty = 0;
-static volatile uint8_t  s_imuReverse   = 0; /* 1 = 후진 방향 */
+/* IMU 출처일 때 마지막으로 수신한 "원본" 자세각(0.1도 단위).
+ * duty로 가공하지 않고 받은 그대로 들고 간다. 변환(부동소수점 연산)은
+ * 수신 태스크가 아니라 ASW_Manual_ProcessControl()에서 수행한다. */
+static volatile int16_t s_imuRollTenths  = 0;
+static volatile int16_t s_imuPitchTenths = 0;
+
+/*
+ * EnterManualIdle : 수동 모드 재진입 시의 "정지 대기" 상태로 되돌린다.
+ *   남아 있던 IMU 각도까지 함께 지우는 이유는, 모드 전환 전의 낡은 각도가
+ *   출처가 다시 IMU로 바뀌는 순간 되살아나 차가 갑자기 움직이는 것을 막기 위해서다.
+ *   여러 값을 함께 바꾸므로 CanRxTask가 섞인 조합을 관측하지 않도록
+ *   대입 전체를 임계구역으로 묶는다.
+ */
+static void EnterManualIdle(void)
+{
+    taskENTER_CRITICAL();
+    s_lastCmd        = 'S'; /* 수동 재진입 시 정지 상태로 시작 */
+    s_cmdSource      = ASW_MANUAL_CMD_SOURCE_NONE;
+    s_imuRollTenths  = 0;
+    s_imuPitchTenths = 0;
+    taskEXIT_CRITICAL();
+}
 
 void ASW_Manual_Init(void)
 {
-    s_lastCmd    = 'S';
+    EnterManualIdle();
     s_lastRxTick = osKernelSysTick();
-    s_cmdSource  = ASW_MANUAL_CMD_SOURCE_NONE;
-
-    s_imuLeftDuty  = 0;
-    s_imuRightDuty = 0;
-    s_imuReverse   = 0;
 }
 
 /*
@@ -89,7 +101,6 @@ static void ComputeTiltDuty(float rollDeg, float pitchDeg,
                             uint16_t *outLeft, uint16_t *outRight,
                             uint8_t *outReverse)
 {
-    float clampedPitch;
     float clampedRoll;
     float baseDuty;
     float turnBias;
@@ -108,45 +119,19 @@ static void ComputeTiltDuty(float rollDeg, float pitchDeg,
 
     /* 기본 속도 : 기울기 크기를 MIN_DUTY~MAX_DUTY 구간에 선형으로 대응시킨다.
      * 데드존을 막 벗어났을 때 0이 아니라 MIN_DUTY에서 시작해야 모터가 실제로 돈다. */
-    clampedPitch = ClampF(pitchDeg, -ASW_IMU_MAX_TILT_DEG, ASW_IMU_MAX_TILT_DEG);
     baseDuty = (float)ASW_IMU_MIN_DUTY +
-               (AbsF(clampedPitch) / ASW_IMU_MAX_TILT_DEG) *
-               (float)(ASW_IMU_MAX_DUTY - ASW_IMU_MIN_DUTY);
+               (ClampF(AbsF(pitchDeg), 0.0f, ASW_IMU_MAX_TILT_DEG) / ASW_IMU_MAX_TILT_DEG) *
+               ASW_IMU_DUTY_SPAN;
 
-    /* 조향 편차 : 좌우 기울기를 좌/우 duty에 +/-로 나눠 준다. */
+    /* 조향 편차 : 좌우 기울기를 좌/우 duty에 +/-로 나눠 준다.
+     * (pitch와 달리 roll은 좌/우 부호가 그대로 필요하므로 절댓값을 쓰지 않는다.) */
     clampedRoll = ClampF(rollDeg, -ASW_IMU_MAX_TILT_DEG, ASW_IMU_MAX_TILT_DEG);
     turnBias = (clampedRoll / ASW_IMU_MAX_TILT_DEG) *
-               (float)(ASW_IMU_MAX_DUTY - ASW_IMU_MIN_DUTY) * 0.5f;
+               ASW_IMU_DUTY_SPAN * 0.5f;
                /* 절반 범위: 조향 편차만 주고 혼자 포화되지 않게 */
 
     *outLeft  = (uint16_t)ClampF(baseDuty + turnBias, 0.0f, (float)ASW_IMU_MAX_DUTY);
     *outRight = (uint16_t)ClampF(baseDuty - turnBias, 0.0f, (float)ASW_IMU_MAX_DUTY);
-}
-
-/*
- * ASW_Manual_ApplyImuAttitude : 0.1도 단위 정수 각도를 받아 IMU 명령 상태를 갱신한다.
- *   이 파일의 ASW_Manual_ApplyCanCommand()에서만 호출하므로 static으로 둔다.
- *   부동소수점 연산은 임계구역 밖에서 끝내고, 공유 변수 5개에 대한 "대입만"
- *   하나의 임계구역으로 묶는다. 다섯 값이 한 덩어리로 보여야 CtrlTask가
- *   섞인 조합(예: 새 duty + 옛 방향)을 관측하지 않는다.
- */
-static void ASW_Manual_ApplyImuAttitude(int16_t rollTenths, int16_t pitchTenths)
-{
-    float    rollDeg  = (float)rollTenths  / 10.0f;
-    float    pitchDeg = (float)pitchTenths / 10.0f;
-    uint16_t leftDuty  = 0u;
-    uint16_t rightDuty = 0u;
-    uint8_t  reverse   = 0u;
-
-    ComputeTiltDuty(rollDeg, pitchDeg, &leftDuty, &rightDuty, &reverse);
-
-    taskENTER_CRITICAL();
-    s_imuLeftDuty  = leftDuty;
-    s_imuRightDuty = rightDuty;
-    s_imuReverse   = reverse;
-    s_lastRxTick   = osKernelSysTick();
-    s_cmdSource    = ASW_MANUAL_CMD_SOURCE_IMU;
-    taskEXIT_CRITICAL();
 }
 
 /*
@@ -158,7 +143,7 @@ void ASW_Manual_ApplyCanCommand(const McalCanMsg_t *p_msg)
 {
     switch (p_msg->id)
     {
-        case MCAL_CAN_ID_MASTER_MODE_CMD:
+        case MCAL_CAN_ID_REMOTE_MODE_CMD:
             RTE_Motor_Stop(); /* 모드 전환 시 항상 정지 먼저 (요구사항 2번) */
             if (p_msg->data[0] == 1u)
             {
@@ -168,22 +153,12 @@ void ASW_Manual_ApplyCanCommand(const McalCanMsg_t *p_msg)
             else
             {
                 RTE_Mode_SetDriveMode(RTE_DRIVE_MODE_MANUAL);
-                /* 상태 3종(s_lastCmd/s_lastRxTick/s_cmdSource)은 CtrlTask와
-                 * CanRxTask 양쪽에서 갱신되므로, 섞인 조합이 관측되지 않도록
-                 * 대입만 임계구역으로 묶는다. */
-                taskENTER_CRITICAL();
-                s_lastCmd   = 'S'; /* 수동 재진입 시 정지 상태로 시작 */
-                s_cmdSource = ASW_MANUAL_CMD_SOURCE_NONE;
-                /* 남아 있던 IMU duty가 모드 전환 후에 되살아나지 않도록 같이 지운다. */
-                s_imuLeftDuty  = 0;
-                s_imuRightDuty = 0;
-                s_imuReverse   = 0;
-                taskEXIT_CRITICAL();
+                EnterManualIdle();
                 printf("[MODE] AUTO -> MANUAL (CAN 0x100 rx)\r\n");
             }
             break;
 
-        case MCAL_CAN_ID_MASTER_MANUAL_CMD:
+        case MCAL_CAN_ID_REMOTE_MANUAL_CMD:
             /* 3개 값이 한 덩어리로 보이도록 대입만 임계구역으로 묶는다.
              * (섞이면 CAN 명령에 SERIAL 출처가 붙어 5000ms 기준이 적용된다.) */
             taskENTER_CRITICAL();
@@ -205,7 +180,18 @@ void ASW_Manual_ApplyCanCommand(const McalCanMsg_t *p_msg)
         {
             int16_t rollTenths  = (int16_t)(((uint16_t)p_msg->data[0] << 8) | p_msg->data[1]);
             int16_t pitchTenths = (int16_t)(((uint16_t)p_msg->data[2] << 8) | p_msg->data[3]);
-            ASW_Manual_ApplyImuAttitude(rollTenths, pitchTenths);
+
+            /* 여기서는 "받은 각도 그대로" 저장만 한다. duty 변환(부동소수점)은
+             * 이 MCU에 FPU가 없어 비싸므로, 최우선순위인 CanRxTask가 아니라
+             * 50ms 주기의 CtrlTask(ASW_Manual_ProcessControl)에서 수행한다.
+             * 4개 값이 한 덩어리로 보이도록 대입만 임계구역으로 묶는다.
+             * (roll/pitch가 찢어져 읽히면 엉뚱한 조향이 한 주기 섞여 나간다.) */
+            taskENTER_CRITICAL();
+            s_imuRollTenths  = rollTenths;
+            s_imuPitchTenths = pitchTenths;
+            s_lastRxTick     = osKernelSysTick();
+            s_cmdSource      = ASW_MANUAL_CMD_SOURCE_IMU;
+            taskEXIT_CRITICAL();
             break;
         }
 
@@ -224,21 +210,6 @@ static uint8_t ASW_Manual_IsDriveCmdChar(uint8_t ch)
 {
     return (((ch == 'F') || (ch == 'B') || (ch == 'L') ||
              (ch == 'R') || (ch == 'S')) ? 1u : 0u);
-}
-
-/*
- * RefreshSerialRxTickIfActive : 이미 SERIAL 출처로 감시 중일 때만 타임스탬프 갱신.
- *   s_cmdSource를 읽고 s_lastRxTick을 쓰므로, CanRxTask와의 경합을 막기 위해
- *   두 문장을 임계구역으로 묶는다.
- */
-static void RefreshSerialRxTickIfActive(void)
-{
-    taskENTER_CRITICAL();
-    if (s_cmdSource == ASW_MANUAL_CMD_SOURCE_SERIAL)
-    {
-        s_lastRxTick = osKernelSysTick();
-    }
-    taskEXIT_CRITICAL();
 }
 
 /*
@@ -270,8 +241,15 @@ void ASW_Manual_ApplySerialChar(uint8_t ch)
          * 시작해버리면 안 되므로, 이미 SERIAL 출처로 감시 중일 때만 갱신한다.
          * (자동 모드에서는 ASW_Manual_ProcessControl이 호출되지 않아 당장은
          *  영향이 없지만, "타임스탬프는 SERIAL 출처일 때만 의미를 갖는다"는
-         *  규칙을 코드 전체에서 똑같이 지키기 위해 이렇게 맞춰 둔다.) */
-        RefreshSerialRxTickIfActive();
+         *  규칙을 코드 전체에서 똑같이 지키기 위해 이렇게 맞춰 둔다.)
+         * s_cmdSource를 읽고 s_lastRxTick을 쓰므로, CanRxTask와의 경합을 막기
+         * 위해 두 문장을 임계구역으로 묶는다. */
+        taskENTER_CRITICAL();
+        if (s_cmdSource == ASW_MANUAL_CMD_SOURCE_SERIAL)
+        {
+            s_lastRxTick = osKernelSysTick();
+        }
+        taskEXIT_CRITICAL();
 
         /* 여기 있던 블로킹 로그(printf)는 제거했다. 블루투스와 같은 USART1
          * (9600bps)으로 나가면서 한 줄에 30ms 넘게 블로킹되어 50ms 제어주기를
@@ -281,14 +259,7 @@ void ASW_Manual_ApplySerialChar(uint8_t ch)
     {
         RTE_Motor_Stop();
         RTE_Mode_SetDriveMode(RTE_DRIVE_MODE_MANUAL);
-        taskENTER_CRITICAL();
-        s_lastCmd   = 'S'; /* 수동 재진입 시 정지 상태로 시작 */
-        s_cmdSource = ASW_MANUAL_CMD_SOURCE_NONE;
-        /* 남아 있던 IMU duty가 모드 전환 후에 되살아나지 않도록 같이 지운다. */
-        s_imuLeftDuty  = 0;
-        s_imuRightDuty = 0;
-        s_imuReverse   = 0;
-        taskEXIT_CRITICAL();
+        EnterManualIdle();
 
         /* 출처를 NONE으로 되돌리므로 ASW_Manual_IsCommandTimeout()이 곧바로 0을
          * 반환한다. 즉 타임아웃 감시 자체가 꺼진 상태라 타임스탬프는 아무 의미가
@@ -370,62 +341,62 @@ void ASW_Manual_ProcessControl(void)
         return;
     }
 
-    if (s_cmdSource == ASW_MANUAL_CMD_SOURCE_IMU)
+    switch (s_cmdSource)
     {
-        uint16_t leftDuty;
-        uint16_t rightDuty;
-        uint8_t  reverse;
-
-        /* CanRxTask가 세 값을 한 덩어리로 쓰므로, 읽을 때도 한 덩어리로 읽는다.
-         * (중간에 갱신되면 새 duty에 옛 방향이 붙는 조합이 나올 수 있다.) */
-        taskENTER_CRITICAL();
-        leftDuty  = s_imuLeftDuty;
-        rightDuty = s_imuRightDuty;
-        reverse   = s_imuReverse;
-        taskEXIT_CRITICAL();
-
-        if ((leftDuty == 0u) && (rightDuty == 0u))
+        case ASW_MANUAL_CMD_SOURCE_IMU:
         {
-            RTE_Motor_Stop(); /* 데드존(리모컨을 평평하게 든 상태) */
-        }
-        else if (reverse == 0u)
-        {
-            RTE_Motor_DriveForwardDifferential(leftDuty, rightDuty);
-        }
-        else
-        {
-            /* [후진 차등 조향 경로]
-             * RTE_Motor_SetSpeed(= ECU_L298N_SetSpeed)는 PWM duty 레지스터만 쓰고
-             * IN 방향 핀은 전혀 건드리지 않는다. 그런데 L298N에는 "후진 차등"
-             * API가 없다(DriveForwardDifferential은 전진 전용).
-             * 그래서 먼저 RTE_Motor_DriveBackward(0u)를 호출해 양쪽 IN 핀만
-             * 후진 방향으로 세팅하고(duty를 0으로 주는 이유는, 잠깐이라도
-             * 최대 속도로 튀는 글리치를 막기 위해서다), 바로 이어서
-             * RTE_Motor_SetSpeed()로 좌/우 독립 duty를 얹는다.
-             * 이렇게 하면 기존 공개 API만으로 후진에서도 차등 조향이 된다.
-             *
-             * [의존성 주의] 이 방식은 SetSpeed가 "duty 전용"이라는 사실에
-             * 기대고 있다. 만약 SetSpeed가 나중에 방향 핀까지 건드리도록
-             * 바뀌면 이 경로는 반드시 다시 검토해야 한다. */
-            RTE_Motor_DriveBackward(0u);
-            RTE_Motor_SetSpeed(leftDuty, rightDuty);
-        }
-        return; /* IMU 출처는 아래 문자 명령 switch를 타지 않는다. */
-    }
+            int16_t  rollTenths;
+            int16_t  pitchTenths;
+            uint16_t leftDuty  = 0u;
+            uint16_t rightDuty = 0u;
+            uint8_t  reverse   = 0u;
 
-    switch (s_lastCmd)
-    {
-        case 'F': RTE_Motor_DriveForward(ASW_MANUAL_SPEED_DUTY);  break;
-        case 'B': RTE_Motor_DriveBackward(ASW_MANUAL_SPEED_DUTY); break;
-        case 'L': RTE_Motor_TurnLeft(ASW_MANUAL_SPEED_DUTY);      break;
-        case 'R': RTE_Motor_TurnRight(ASW_MANUAL_SPEED_DUTY);     break;
-        case 'S':
-        /* [default의 의미 변경]
-         * 이제 s_lastCmd에는 ASW_Manual_ApplySerialChar()에서 검증을 통과한
-         * 명령 문자(F/B/L/R/S)만 저장되므로, default는 원래 도달하지 않는다.
-         * 만약을 대비해 정지시키는 방어 코드로만 남겨 둔다.
-         * (CAN 경로는 마스터가 보낸 값을 그대로 넣으므로, 마스터가 이상한 값을
-         *  보냈을 때 안전하게 멈추는 최후의 보루 역할도 겸한다.) */
-        default:  RTE_Motor_Stop();                          break;
+            /* CanRxTask가 두 각도를 한 덩어리로 쓰므로, 읽을 때도 한 덩어리로
+             * 읽는다. (찢어져 읽히면 새 roll에 옛 pitch가 붙는다.) */
+            taskENTER_CRITICAL();
+            rollTenths  = s_imuRollTenths;
+            pitchTenths = s_imuPitchTenths;
+            taskEXIT_CRITICAL();
+
+            /* 부동소수점 변환은 임계구역 밖에서. 이 MCU에는 FPU가 없어
+             * 소프트웨어 부동소수점으로 도는데, 그 비용을 50ms 주기의
+             * CtrlTask가 부담하게 하고 최우선순위 CanRxTask는 비워 둔다. */
+            ComputeTiltDuty((float)rollTenths  / 10.0f,
+                            (float)pitchTenths / 10.0f,
+                            &leftDuty, &rightDuty, &reverse);
+
+            if ((leftDuty == 0u) && (rightDuty == 0u))
+            {
+                RTE_Motor_Stop(); /* 데드존(리모컨을 평평하게 든 상태) */
+            }
+            else if (reverse == 0u)
+            {
+                RTE_Motor_DriveForwardDifferential(leftDuty, rightDuty);
+            }
+            else
+            {
+                /* 후진에서도 좌/우 duty를 따로 주어 차등 조향을 유지한다. */
+                RTE_Motor_DriveBackwardDifferential(leftDuty, rightDuty);
+            }
+            break;
+        }
+
+        default:
+            switch (s_lastCmd)
+            {
+                case 'F': RTE_Motor_DriveForward(ASW_MANUAL_SPEED_DUTY);  break;
+                case 'B': RTE_Motor_DriveBackward(ASW_MANUAL_SPEED_DUTY); break;
+                case 'L': RTE_Motor_TurnLeft(ASW_MANUAL_SPEED_DUTY);      break;
+                case 'R': RTE_Motor_TurnRight(ASW_MANUAL_SPEED_DUTY);     break;
+                case 'S':
+                /* [default의 의미 변경]
+                 * 이제 s_lastCmd에는 ASW_Manual_ApplySerialChar()에서 검증을 통과한
+                 * 명령 문자(F/B/L/R/S)만 저장되므로, default는 원래 도달하지 않는다.
+                 * 만약을 대비해 정지시키는 방어 코드로만 남겨 둔다.
+                 * (CAN 경로는 remote 노드가 보낸 값을 그대로 넣으므로, 이상한 값이
+                 *  왔을 때 안전하게 멈추는 최후의 보루 역할도 겸한다.) */
+                default:  RTE_Motor_Stop();                          break;
+            }
+            break;
     }
 }

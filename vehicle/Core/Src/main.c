@@ -101,8 +101,17 @@ volatile uint32_t g_vdiag_can_esr_raw     = 0u;  /* ESR 레지스터 원본값 *
 volatile uint32_t g_vdiag_can_tx_ok       = 0u;  /* 송신 요청 성공 누적 횟수 */
 volatile uint32_t g_vdiag_can_tx_fail     = 0u;  /* 송신 요청 실패 누적 횟수 */
 volatile uint32_t g_vdiag_can_free_mb     = 0u;  /* 비어 있는 송신 메일박스 수 (0~3) */
-volatile uint32_t g_vdiag_can_recover_cnt = 0u;  /* 버스오프 복구 시도 누적 횟수 */
-volatile uint8_t  g_vdiag_can_unrecoverable = 0u;  /* CAN 셀이 굳어 리셋 없이는 복구 불가면 1 */
+volatile uint32_t g_vdiag_can_recover_cnt = 0u;  /* 버스오프 복구 "성공" 누적 횟수
+                                                  * (시도가 아니라 Stop+Start가 모두
+                                                  *  성공한 경우에만 증가한다) */
+volatile uint8_t  g_vdiag_can_stuck       = 0u;  /* 지금 버스오프 복구가 안 되고 막혀 있는 상태면 1
+                                                  * (영구 래치가 아니라 현재 상태를 나타내는 레벨
+                                                  *  플래그. 복구에 성공하는 즉시 0으로 돌아온다) */
+volatile uint8_t  g_vdiag_can_notify_ok   = 0u;  /* CAN 수신 인터럽트가 켜져 있으면 1 */
+
+/* CtrlTask가 한 주기 돌 때마다 1씩 증가 (생존 증명).
+ * CanTxTask가 약 1초 주기로 이 값의 증가 여부를 확인해 HEARTBEAT에 실어 보낸다. */
+volatile uint32_t g_ctrl_loop_alive_counter = 0u;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/

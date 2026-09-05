@@ -278,11 +278,11 @@
 | **0x110** | MANUAL_CMD | remote → vehicle | **미구현 (의도적)** | 구현 | `data[0]`에 'F'/'B'/'L'/'R'/'S' 방향 문자. remote는 문자 명령 대신 `0x120`(각도)로 조종하므로 이 경로는 당분간 안 씀 |
 | **0x120** | IMU_ATTITUDE | remote → vehicle | **구현** | **구현** | MPU-9255 roll/pitch(0.1도 단위). 100ms 주기 브로드캐스트, vehicle이 좌우 차동 PWM으로 변환 |
 | **0x200** | VEHICLE_STATUS | vehicle → 전체 | 구현 | — | 100ms 주기, 주행모드 + 좌·전·우 거리값 |
-| **0x3F0** | HEARTBEAT | vehicle → 전체 | **구현** | — | 1초 주기, 1바이트(0=정상 / 1=CAN 버스오프 복구 불가 상태 래치) |
+| **0x3F0** | HEARTBEAT | vehicle → 전체 | **구현** | — | 1초 주기, 1바이트 상태 비트필드 — 아래 참고 |
 
 실제로 버스에 흐르는 것은 **`0x120`(remote→vehicle)과 `0x200`·`0x3F0`(vehicle→전체) 세 가지**입니다. `0x100`/`0x110`은 여전히 수신 처리 코드만 있고, 이를 실제로 보내는 remote 쪽 코드는 **이번 단계에서 일부러 만들지 않았습니다** — remote 보드에는 모드 전환을 트리거할 버튼이 없어서, "이만큼 기울이면 자동 전환" 같은 임의 규칙을 지어내는 대신 이 부분은 계속 BT 앱(vehicle의 시리얼 경로)이 맡도록 남겨 뒀습니다. 대신 remote가 새로 만드는 신호(기울기)는 `0x120` 하나에만 실어 보내고, vehicle은 이를 **세 번째 수동조종 명령 출처(IMU)** 로 받아 CAN 출처와 동일한 1000ms 무응답 기준으로 감시합니다 — 자세한 변환 규칙은 6-4를 참고하세요.
 
-> **코드상의 이름은 아직 예전 것입니다** — `mcal_can.h`의 매크로는 NUCLEO 마스터 구성 시절의 이름(`MCAL_CAN_ID_MASTER_MODE_CMD`, `MCAL_CAN_ID_MASTER_MANUAL_CMD`, `MCAL_CAN_ID_SLAVE_STATUS`, `MCAL_CAN_ID_SLAVE_HEARTBEAT`)을 그대로 쓰고 있습니다. `0x120`만 새로 추가하며 `MCAL_CAN_ID_REMOTE_IMU_ATTITUDE`로 이름을 붙였습니다(이 ID는 예전 NUCLEO 구성에 없던 것이라 새 이름 규칙을 바로 적용). 나머지 기존 매크로 이름을 `REMOTE_`/`VEHICLE_` 기준으로 정리하는 작업은 아직 남아 있습니다.
+> **코드상의 이름을 정리했습니다** — `mcal_can.h`의 매크로를 NUCLEO 마스터 구성 시절의 이름(`MCAL_CAN_ID_MASTER_MODE_CMD` 등)에서 현재 아키텍처를 그대로 반영한 이름(`MCAL_CAN_ID_REMOTE_MODE_CMD`, `MCAL_CAN_ID_REMOTE_MANUAL_CMD`, `MCAL_CAN_ID_VEHICLE_STATUS`, `MCAL_CAN_ID_VEHICLE_HEARTBEAT`)으로 바꾸고, 모든 호출부(스위치문·송신 코드)를 같이 갱신했습니다. ID 값은 그대로입니다. (단, `McalCanSlaveState_t`처럼 ID가 아닌 다른 곳에 남은 "slave" 표현은 이번 범위 밖이라 아직 남아 있습니다.)
 
 ### 6-4. 메시지 포맷
 
@@ -299,6 +299,17 @@
 | data[6~7] | 예약 | 0 |
 
 거리값을 1바이트로 담기 때문에 255cm에서 포화됩니다. 자율주행 판단 임계값이 최대 85cm이므로 제어에는 영향이 없고, 이 필드는 원격 모니터링 용도입니다.
+
+**0x3F0 HEARTBEAT** (DLC 1, 1초 주기 브로드캐스트) — data[0]은 단일 플래그가 아니라 **상태 비트필드**입니다.
+
+| 비트 | 의미 |
+|---|---|
+| bit0 | CAN 버스오프 복구가 지금 실패 상태(`g_vdiag_can_stuck`) — 성공하면 자동으로 0으로 돌아가는 레벨 플래그, 영구 래치 아님 |
+| bit1 | CAN 에러패시브(EPVF) 상태 |
+| bit2 | CAN 에러경고(EWGF) 상태 |
+| bit3 | CAN RX 인터럽트(notification)가 비활성 상태 |
+| bit4 | 50ms 제어 루프(CtrlTask)가 정지된 것으로 추정됨 — 하트비트 주기마다 루프 카운터가 증가했는지로 판정. **이 비트가 실제로 존재하는 이유**: 처음 버전은 CanTxTask(최저 우선순위)가 아직 돌고 있다는 것만 증명해서, 정작 CtrlTask가 멈춰 모터가 마지막 명령으로 계속 도는 상황에서도 "정상"으로 보고되는 문제가 있었습니다 |
+| bit5~7 | 예약, 0 |
 
 **0x100 / 0x110 명령** — 두 메시지 모두 `data[0]` 1바이트만 사용합니다. 모드 명령은 1/0, 수동 명령은 방향 문자 1개로, 블루투스 명령과 동일한 표현을 써서 **두 경로가 같은 처리 함수로 합류**하도록 했습니다.
 
@@ -323,7 +334,7 @@
 | pitch 부호 | 양수(앞으로 기울임) = 전진, 음수 = 후진 |
 | roll 크기·부호 | 위에서 구한 기본 duty에 좌/우 반대 부호로 절반 범위만큼 가감 — 조향 편차만 주고 그 자체로 포화되지 않게 함 |
 
-전진은 기존 `RTE_Motor_DriveForwardDifferential(left, right)`로 처리합니다. 후진 차동 조향 API는 원래 없어서(`DriveForwardDifferential`은 전진 전용), `RTE_Motor_DriveBackward(0)`으로 방향 핀만 후진으로 세팅한 뒤 곧바로 `RTE_Motor_SetSpeed(left, right)`로 좌우 독립 duty를 얹는 방식으로 기존 공개 API만으로 후진 차동 조향을 만들었습니다.
+전진은 기존 `RTE_Motor_DriveForwardDifferential(left, right)`로, 후진은 이번에 새로 만든 `RTE_Motor_DriveBackwardDifferential(left, right)`로 처리합니다 — `ECU_L298N_DriveForwardDifferential`을 그대로 본떠 방향 핀만 후진 헬퍼로 바꾼 대응 함수를 BSW/RTE에 추가했습니다. (처음에는 `RTE_Motor_DriveBackward(0)`으로 방향 핀만 세팅한 뒤 `RTE_Motor_SetSpeed`를 얹는 임시방편으로 구현했었는데, "`SetSpeed`가 방향 핀을 안 건드린다"는 문서화되지 않은 사실에 기대는 방식이라 정리 과정에서 정식 API로 교체했습니다.)
 
 **방향 문자가 아니라 각도 원본을 보내기로 한 이유** — 기울기를 `'L'`/`'R'` 같은 방향 문자로 바꿔서 보내면, 보내는 쪽에서 이미 "왼쪽"이라는 결론까지 내버린 것이라 **얼마나 기울었는지가 사라집니다.** 각도를 그대로 보내면 두 가지가 가능해집니다.
 

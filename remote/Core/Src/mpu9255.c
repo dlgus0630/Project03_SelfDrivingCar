@@ -33,12 +33,10 @@
 
 /* Private define ------------------------------------------------------------*/
 
-/* AD0 핀을 GND 에 붙여 두었으므로 7비트 주소는 0x68 이다.
-   (AD0 를 3.3V 에 붙였다면 0x69 가 된다)
-   HAL 함수는 읽기/쓰기 구분 칸이 붙은 8비트 형태의 주소를 받으므로
+/* HAL 함수는 읽기/쓰기 구분 칸이 붙은 8비트 형태의 주소를 받으므로
    7비트 주소를 왼쪽으로 한 칸 밀어서 넘겨야 한다. 이걸 빼먹으면
-   엉뚱한 절반 주소로 두드리게 되어 아무 응답도 못 받는다. */
-#define MPU9255_ADDR_7BIT            0x68u
+   엉뚱한 절반 주소로 두드리게 되어 아무 응답도 못 받는다.
+   (7비트 주소 MPU9255_ADDR_7BIT 는 mpu9255.h 에 있다) */
 #define MPU9255_I2C_ADDR             ((uint16_t)(MPU9255_ADDR_7BIT << 1))
 
 /* ---- 레지스터 번호 (가속도 + 자이로에 필요한 것만 추렸다) ---- */
@@ -49,7 +47,6 @@
 #define MPU9255_REG_ACCEL_XOUT_H     0x3Bu   /* 가속도 6바이트의 첫 칸 */
 #define MPU9255_REG_GYRO_XOUT_H      0x43u   /* 자이로 6바이트의 첫 칸 */
 #define MPU9255_REG_PWR_MGMT_1       0x6Bu   /* 전원 관리 1 (잠에서 깨우는 자리) */
-#define MPU9255_REG_WHO_AM_I         0x75u   /* 어떤 칩인지 알려주는 자리 */
 
 /* ---- 위 레지스터에 써 넣을 값 ---- */
 
@@ -148,15 +145,11 @@ static uint8_t Mpu9255_CalibrateGyro(void);
 static uint8_t Mpu9255_WriteReg(uint8_t reg, uint8_t value)
 {
   uint8_t attempt;
-  uint8_t buf;
-
-  /* HAL 에 넘길 값은 주소를 넘길 수 있는 변수여야 하므로 한 칸에 옮겨 담는다 */
-  buf = value;
 
   for (attempt = 0u; attempt < MPU9255_INIT_RETRY_CNT; attempt++)
   {
     if (HAL_I2C_Mem_Write(&hi2c1, MPU9255_I2C_ADDR, (uint16_t)reg,
-                          I2C_MEMADD_SIZE_8BIT, &buf, 1u,
+                          I2C_MEMADD_SIZE_8BIT, &value, 1u,
                           MPU9255_I2C_TIMEOUT_MS) == HAL_OK)
     {
       return 1u;
@@ -325,10 +318,13 @@ uint8_t Mpu9255_Init(void)
 
   /* ---------- 2단계 : 잠에서 깨운다 ----------
      이것이 가장 먼저 성공해야 하는 쓰기다. 이 전에는 무엇을 읽어도 0 만 나온다. */
-  if (Mpu9255_WriteReg(MPU9255_REG_PWR_MGMT_1, MPU9255_PWR_CLK_PLL_XGYRO) == 0u)
-  {
-    all_ok = 0u;
-  }
+  /* [왜 && 가 아니라 & 인가]
+     && 는 앞이 이미 실패로 판가름 나면 뒤를 아예 실행하지 않는다.
+     여기서는 앞 단계가 실패했더라도 나머지 레지스터 쓰기는 전부 시도해야 한다.
+     한 칸이 실패했다고 나머지 설정을 통째로 건너뛰면 센서가 어중간한 설정으로
+     남아, 무엇이 문제였는지도 알 수 없게 된다.
+     & 는 양쪽을 다 실행한 뒤에 결과만 모으므로 이 요구에 그대로 들어맞는다. */
+  all_ok &= Mpu9255_WriteReg(MPU9255_REG_PWR_MGMT_1, MPU9255_PWR_CLK_PLL_XGYRO);
 
   /* 발진기가 자리를 잡을 때까지 잠깐 기다린다.
      이 자리는 FreeRTOS 태스크 안이므로 HAL_Delay() 가 아니라 osDelay() 다.
@@ -340,29 +336,17 @@ uint8_t Mpu9255_Init(void)
      전원을 넣으면 이 값은 0 이고, 그것이 곧 "가장 빠른 속도로 갱신하라"는 뜻이다.
      우리는 20ms 마다 필요할 때 꺼내 쓰는 방식이라 칩이 우리보다 빨리 갱신해 주는 편이
      오히려 낫다. 그래서 일부러 손대지 않고 기본값 그대로 둔다. */
-  if (Mpu9255_WriteReg(MPU9255_REG_CONFIG, MPU9255_DLPF_44HZ) == 0u)
-  {
-    all_ok = 0u;
-  }
+  all_ok &= Mpu9255_WriteReg(MPU9255_REG_CONFIG, MPU9255_DLPF_44HZ);
 
-  if (Mpu9255_WriteReg(MPU9255_REG_GYRO_CONFIG, MPU9255_GYRO_FS_250DPS) == 0u)
-  {
-    all_ok = 0u;
-  }
+  all_ok &= Mpu9255_WriteReg(MPU9255_REG_GYRO_CONFIG, MPU9255_GYRO_FS_250DPS);
 
-  if (Mpu9255_WriteReg(MPU9255_REG_ACCEL_CONFIG, MPU9255_ACCEL_FS_2G) == 0u)
-  {
-    all_ok = 0u;
-  }
+  all_ok &= Mpu9255_WriteReg(MPU9255_REG_ACCEL_CONFIG, MPU9255_ACCEL_FS_2G);
 
   /* ---------- 4단계 : 자이로 영점을 잰다 (약 1초) ----------
      보드가 아직 가만히 있다는 것을 전제로 한다.
      이 사이에 보드를 들거나 흔들면 그 움직임이 영점으로 굳어 버려
      이후 각도가 계속 한쪽으로 흘러간다. */
-  if (Mpu9255_CalibrateGyro() == 0u)
-  {
-    all_ok = 0u;
-  }
+  all_ok &= Mpu9255_CalibrateGyro();
 
   return all_ok;
 }

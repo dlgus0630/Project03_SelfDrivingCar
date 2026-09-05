@@ -3,7 +3,7 @@
  *
  *  Layer  : ASW (Application Software)
  *  Module : ASW_MANUAL_CONTROL
- *  Desc   : Node1(NUCLEO)이 블루투스로 수신한 조향/속도 명령을
+ *  Desc   : remote 노드가 블루투스로 수신한 조향/속도 명령을
  *           CAN을 통해 전달받아 모터를 구동하는 수동 주행 로직.
  *           기존 bluetooth.c(USART1 직접 수신) 로직을 CAN 기반으로 대체.
  *           휴대폰 블루투스 앱(USART1 직접 수신)의 단일문자 명령도 함께 처리한다.

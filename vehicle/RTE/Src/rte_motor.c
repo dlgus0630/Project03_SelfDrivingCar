@@ -51,6 +51,11 @@ void RTE_Motor_DriveForwardDifferential(uint16_t leftDuty, uint16_t rightDuty)
     ECU_L298N_DriveForwardDifferential(leftDuty, rightDuty);
 }
 
+void RTE_Motor_DriveBackwardDifferential(uint16_t leftDuty, uint16_t rightDuty)
+{
+    ECU_L298N_DriveBackwardDifferential(leftDuty, rightDuty);
+}
+
 void RTE_Motor_PivotLeft(uint32_t duty)
 {
     ECU_L298N_PivotLeft(duty);

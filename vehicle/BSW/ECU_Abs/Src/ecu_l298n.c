@@ -142,6 +142,20 @@ void ECU_L298N_DriveForwardDifferential(uint16_t leftDuty, uint16_t rightDuty)
     L298n_SetRightDuty(rightDuty);
 }
 
+/* 좌/우 바퀴 개별 duty로 "후진" (양쪽 모두 후진 방향, 속도차만 상이).
+ * 방향 핀을 뒤집기 전에 duty를 먼저 0으로 내린다. 이전 전진 명령의 높은 duty가
+ * PWM 레지스터에 남은 채 방향 핀만 후진으로 바뀌면(한 제어주기 50ms 안에서
+ * 급전진->급후진 전환 시) 옛 속도 그대로 역방향으로 튀는 현상이 발생하기 때문. */
+void ECU_L298N_DriveBackwardDifferential(uint16_t leftDuty, uint16_t rightDuty)
+{
+    L298n_SetLeftDuty(0);
+    L298n_SetRightDuty(0);
+    L298n_SetLeftBackward();
+    L298n_SetRightBackward();
+    L298n_SetLeftDuty(leftDuty);
+    L298n_SetRightDuty(rightDuty);
+}
+
 /* 좌측 제자리 피벗: 좌측 바퀴 후진 + 우측 바퀴 전진 -> 차체 중심이 거의
  * 이동하지 않고 반시계 방향으로 회전 (편측 정지 회전과 달리 전방으로 쓸리지 않음). */
 void ECU_L298N_PivotLeft(uint32_t duty)
