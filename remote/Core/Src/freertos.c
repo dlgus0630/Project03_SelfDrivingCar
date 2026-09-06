@@ -78,6 +78,26 @@
    그 옆에 끼워 넣으면 다시 만들기(Generate Code) 한 번에 소리 없이 사라진다.
    여기 Variables 구역은 CubeMX 가 건드리지 않고 지켜 주는 자리다. */
 osThreadId ImuTaskHandle;
+
+/* I2C 버스 사용권을 넘겨주는 신호(이진 세마포어)의 손잡이.
+
+   [무엇을 막으려고 두는가]
+   StartDefaultTask 는 부팅 때 127개 주소를 두드리는 I2C 스캔과 그 뒤의 WHO_AM_I
+   읽기를 하고, StartImuTask 는 Mpu9255_Init() 안에서 자기 나름의 I2C 쓰기/읽기와
+   약 1초짜리 자이로 영점 측정을 한다. 두 태스크는 우선순위가 똑같이 Normal 이고
+   osKernelStart() 와 동시에 나란히 깨어나므로, 같은 hi2c1 을 진짜로 동시에 붙잡는다.
+   HAL 이 그것을 막으라고 둔 __HAL_LOCK 은 "잠겨 있나 보고 -> 잠근다"를 두 걸음으로
+   나눠서 하는 코드라, 그 사이에서 태스크가 갈리면 둘 다 자기가 주인이라고 믿는다.
+   그러면 얌전한 HAL_BUSY 가 돌아오는 것이 아니라 전송 자체가 깨지거나 버스가 물린다.
+   (이 프로젝트가 가져다 쓰는 stm32f1xx_hal_def.h 는 그 잠금장치 위에
+    #error "USE_RTOS should be 0" 까지 달아 두었다. RTOS 와 같이 쓰라고 만든
+    물건이 아니라고 벤더가 직접 못을 박아 둔 것이다.)
+   그래서 잠금으로 겹침을 "정리"하려 들지 않고, 애초에 겹치지 않도록 순서를 세운다.
+
+   [ImuTaskHandle 과 나란히 여기에 두는 이유]
+   위와 같은 사정이다. 아래 두 줄은 CubeMX 가 직접 만들어 관리하는 자리라,
+   그 옆에 끼워 넣으면 다시 만들기(Generate Code) 한 번에 소리 없이 사라진다. */
+static osSemaphoreId s_i2cScanDoneSem = NULL;
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
 osThreadId CanRxTaskHandle;
@@ -151,6 +171,36 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
+
+  /* I2C 버스 사용권 신호를 만든다.
+     (두 태스크가 왜 겹치면 안 되는지는 파일 위쪽 s_i2cScanDoneSem 선언부에 적었다.)
+
+     [왜 하필 이 자리인가]
+     MX_FREERTOS_Init() 은 스케줄러가 돌기 전에, 그리고 바로 아래에서 태스크들을
+     만들기도 전에 불린다. 그래서 두 태스크 중 어느 쪽이 먼저 깨어나 이 손잡이를
+     들여다보든 이미 값이 채워져 있는 것이 보장된다. 태스크 안에서 만들었다면
+     "누가 먼저 깨어나느냐"에 따라 아직 NULL 인 손잡이를 보게 되어,
+     겹침을 막으려고 둔 장치가 도리어 또 하나의 경쟁거리가 될 뻔했다.
+
+     [개수를 1 로 두는 이유]
+     이 프로젝트의 FreeRTOSConfig.h 에는 configUSE_COUNTING_SEMAPHORES 가 없다.
+     그래서 osSemaphoreCreate() 에 1 이 아닌 개수를 주면 세는 세마포어를 만드는
+     쪽으로 갔다가 아무것도 못 만들고 NULL 만 돌아온다.
+     1 은 취향으로 고른 값이 아니라 여기서 유일하게 쓸 수 있는 값이다.
+
+     [만들자마자 한 번 가져가는 줄이 반드시 있어야 하는 이유]
+     개수 1 짜리는 안에서 vSemaphoreCreateBinary() 로 만들어지는데, 이 방식은
+     세마포어를 "토큰이 이미 하나 놓여 있는" 상태로 내놓는다. 그 토큰을 여기서
+     미리 치워 두지 않으면 StartImuTask 의 기다림이 첫 줄에서 그냥 통과해 버려,
+     순서 세우기가 아무 일도 하지 않는 껍데기가 된다. 겉보기에는 고친 것 같은데
+     실제로는 예전 그대로 겹치는, 가장 알아채기 어려운 모양이 되는 것이다.
+     기다림 없이(0 틱) 가져가는 것이라 스케줄러가 아직 안 도는 여기서도 안전하다. */
+  osSemaphoreDef(I2cScanDoneSem);
+  s_i2cScanDoneSem = osSemaphoreCreate(osSemaphore(I2cScanDoneSem), 1);
+  if (s_i2cScanDoneSem != NULL)
+  {
+    (void)osSemaphoreWait(s_i2cScanDoneSem, 0);
+  }
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -335,6 +385,25 @@ void StartDefaultTask(void const * argument)
      디버거에서 이 값이 1 이 되어야 위의 진단 변수들을 믿고 읽을 수 있다.
      계속 0 이라면 스캔 도중에 멈춰 있다는 뜻이다. */
   g_diag_scan_done = 1u;
+
+  /* 이제 I2C 버스 사용권을 IMU 태스크에 넘긴다.
+
+     [왜 하필 이 줄인가]
+     이 자리는 127개 주소를 두드리는 스캔 고리와, 그 뒤 0x68 갈래에서 하는
+     WHO_AM_I 읽기를 모두 지나온 지점이다. 즉 이 태스크가 hi2c1 을 건드리는
+     마지막 일까지 끝난 자리라, 여기서 넘겨야 겹치는 순간이 한 톨도 남지 않는다.
+     한 줄이라도 위로 올리면 아직 안 끝난 I2C 접근과 IMU 초기화가 겹친다.
+     맨 위의 CAN 루프백 자기진단도 이 지점보다 앞에 있으므로, IMU 태스크는
+     이 신호 하나만 기다리면 부팅 절차 전체가 끝나기를 기다리는 셈이 된다.
+     반대로 더 뒤로 미룰 이유도 없다. 아래 1초 주기 고리는 CAN 만 들여다볼 뿐
+     I2C 는 두 번 다시 건드리지 않으므로, 미뤄 봐야 IMU 시작만 늦어진다.
+
+     손잡이가 NULL 이면 애초에 만들어지지 못한 것이고, 그때는 IMU 태스크가
+     g_diag_scan_done 을 대신 지켜보도록 해 두었으므로 여기서 할 일이 없다. */
+  if (s_i2cScanDoneSem != NULL)
+  {
+    (void)osSemaphoreRelease(s_i2cScanDoneSem);
+  }
 
   printf("----------------------------------------\r\n");
   printf("[알림] 이제부터 1초마다 CAN 수신 현황을 알려드립니다\r\n");
@@ -579,6 +648,9 @@ static void Can_UpdateErrorDiag(void)
   *         그래서 시도할 수 있는 상태인지 먼저 보고, 아니면 수신 인터럽트를
   *         끄지도 않고 그대로 물러난다. 여기서는 사이에 낀 Stop/Start 가 없어
   *         막아 줄 구간 자체가 없기 때문이다.
+  *         다만 물러나면서 g_diag_can_notify_ok 는 0 으로 내린다.
+  *         인터럽트 설정을 그대로 두는 것과, 지금 수신을 믿을 수 있다고
+  *         표시해 두는 것은 별개의 이야기이기 때문이다(그 갈래의 설명 참고).
   *
   *         [횟수는 온전히 성공했을 때만 센다]
   *         g_diag_can_recover_cnt 는 "되살아난 횟수"다. 시도만 하고 실패한 것까지
@@ -610,9 +682,24 @@ static uint8_t Can_TryBusOffRecover(void)
 
   if (hcan.State != HAL_CAN_STATE_LISTENING)
   {
-    /* 멈추기(Stop)를 받아 주지 않는 상태다. 시도 자체가 불가능하므로
-       수신 인터럽트는 건드리지 않고 그대로 둔다. 여기서 꺼 버리면
-       다시 켤 길이 없어 수신이 영영 막힌다. */
+    /* 멈추기(Stop)를 받아 주지 않는 상태다. 시도 자체가 불가능하다.
+
+       [수신 인터럽트(하드웨어)는 여전히 건드리지 않는다]
+       여기서 꺼 버리면 다시 켤 길이 없어 수신이 영영 막힌다. 아래 갈래에서는
+       Stop/Start 를 앞뒤로 감싼 뒤 반드시 다시 켜 주지만, 이 갈래에는 감쌀
+       구간도 다시 켜 줄 자리도 없다. 그러니 하드웨어 설정은 그대로 둔다.
+       이 판단은 예전 그대로다.
+
+       [그런데 진단 플래그는 내린다 - 예전에 이 둘을 한 덩어리로 본 것이 잘못이었다]
+       "수신 인터럽트를 켜 두었는가(하드웨어 설정)"와 "지금 수신을 믿어도 되는가
+       (진단 표시)"는 서로 다른 이야기다. 예전에는 인터럽트를 안 건드린다는 이유로
+       플래그까지 손대지 않았는데, 그러면 이 함수 바깥의 다른 원인으로 CAN 상태가
+       망가졌을 때 g_diag_can_notify_ok 가 마지막에 적힌 값("정상")에 그대로
+       멈춰 앉아 버린다. 손잡이가 LISTENING 조차 아니라면 인터럽트 설정이 어떻든
+       실제로는 프레임이 올라오지 않는다. 플래그는 이 함수가 무엇을 했는지가 아니라
+       하드웨어의 지금 형편을 비추어야 하므로 0 으로 내린다.
+       (vehicle 쪽 같은 갈래도 같은 이유로 자기 플래그를 여기서 내린다) */
+    g_diag_can_notify_ok = 0u;
     fail_why = "CAN 손잡이가 Stop/Start 를 받지 않습니다";
   }
   else
@@ -631,10 +718,20 @@ static uint8_t Can_TryBusOffRecover(void)
 
     stop_st = HAL_CAN_Stop(&hcan);
 
-    /* 멈추기가 성공해 손잡이가 READY 가 되었을 때에만 시작을 부른다.
-       그렇지 않은 채로 불러 봐야 하드웨어를 건드리지도 못하고 실패만 하므로,
-       아예 부르지 않고 실패로 적어 둔다. */
-    if ((stop_st == HAL_OK) && (hcan.State == HAL_CAN_STATE_READY))
+    /* 멈추기가 성공했을 때에만 시작을 부른다. 그렇지 않은 채로 불러 봐야
+       하드웨어를 건드리지도 못하고 실패만 하므로, 아예 부르지 않고 실패로 적는다.
+
+       [손잡이 상태를 함께 보던 조건을 덜어낸 이유]
+       HAL_CAN_Start() 가 실제로 일하는 조건은 State 가 READY 인 것이다. 그런데
+       벤더 HAL 소스(stm32f1xx_hal_can.c 의 HAL_CAN_Stop())를 보면, HAL_OK 를
+       돌려주는 길은 State 를 HAL_CAN_STATE_READY 로 적어 넣은 바로 다음 줄
+       하나뿐이다. 나머지 두 길(대기 시간 초과, 애초에 LISTENING 이 아님)은 모두
+       HAL_ERROR 로 빠진다. 그러니 stop_st == HAL_OK 라는 사실 자체가 곧
+       "지금 READY 다"라는 보증이다.
+       함께 보던 (hcan.State == HAL_CAN_STATE_READY) 는 늘 참일 수밖에 없는
+       중복 조건이었고, 남겨 두면 읽는 사람에게 "이 둘이 어긋나는 경우가 있나"
+       하는 헛된 의심만 남긴다. 그래서 덜어냈다. */
+    if (stop_st == HAL_OK)
     {
       start_st = HAL_CAN_Start(&hcan);
     }
@@ -716,6 +813,11 @@ static void Can_LoopbackSelfTest(void)
   uint8_t             match_found = 0u;  /* 내가 보낸 시험용 프레임과 같은 것을 받았으면 1 */
   uint8_t             rx_fail     = 0u;  /* 수신함에서 꺼내는 것 자체가 실패했으면 1 */
   uint8_t             other_seen  = 0u;  /* 시험용이 아닌 남의 프레임을 하나라도 받았으면 1 */
+  /* [match_found 와 rx_fail 을 하나로 합치지 않는 이유]
+     꺼내기가 실패해도 고리를 계속 돌게 고쳤기 때문에, 한 번의 시험 안에서
+     rx_fail 이 먼저 서고 그 뒤에 match_found 까지 서는 일이 실제로 일어난다.
+     둘은 더 이상 서로를 밀어내는 사이가 아니라 각각 따로 일어난 사실이므로,
+     한 변수에 몰아넣으면 "미끄러졌지만 결국 성공한" 경우를 표현할 길이 없어진다. */
 
   tx_data[0] = 0xABu;
   tx_data[1] = 0xCDu;
@@ -794,37 +896,62 @@ static void Can_LoopbackSelfTest(void)
         {
           if (HAL_CAN_GetRxMessage(&hcan, CAN_RX_FIFO0, &rx_header, rx_data) != HAL_OK)
           {
-            rx_fail = 1u;
-            break;
-          }
+            /* 꺼내기가 한 번 미끄러졌다고 시험을 통째로 접지 않는다.
+               바로 뒤에 진짜 시험용 프레임이 줄 서 있을 수도 있는데 여기서
+               빠져나가면, 멀쩡한 CAN 셀을 고장으로 적어 버리게 된다.
+               그래서 "그런 일이 있었다"는 사실만 남겨 두고(아래 판정에서
+               결과 5 로 쓰인다) 남은 시간만큼 계속 기다린다.
 
-          if ((rx_header.IDE   == CAN_ID_STD) &&
-              (rx_header.StdId == 0x7FFu)     &&
-              (rx_header.DLC   == 2u)         &&
-              (rx_data[0]      == 0xABu)      &&
-              (rx_data[1]      == 0xCDu))
+               [break 도 continue 도 아닌, 아래로 흘려보내는 이유]
+               break 면 위에 적은 그대로 100ms 예산을 통째로 버리게 된다.
+               continue 는 더 나쁘다. 바로 아래 osDelay(1) 과 waited_ms++ 를
+               건너뛰므로, 꺼내기가 계속 실패하는 상황에서는 100ms 라는 제한이
+               영영 차지 않는다. 그러면 이 태스크가 자리를 내주지 않고 그 자리에서
+               CPU 를 갉아먹으며 맴돌아, 부팅이 아예 더 나아가지 못한다.
+               아무것도 하지 않고 아래로 떨어뜨리는 것이 유일하게 맞는 선택이다. */
+            rx_fail = 1u;
+          }
+          else if ((rx_header.IDE   == CAN_ID_STD) &&
+                   (rx_header.StdId == 0x7FFu)     &&
+                   (rx_header.DLC   == 2u)         &&
+                   (rx_data[0]      == 0xABu)      &&
+                   (rx_data[1]      == 0xCDu))
           {
             match_found = 1u;
             break;
           }
-
-          other_seen = 1u;   /* 남의 프레임 - 버리고 계속 기다린다 */
+          else
+          {
+            other_seen = 1u;   /* 남의 프레임 - 버리고 계속 기다린다 */
+          }
         }
 
         osDelay(1);
         waited_ms++;
       }
 
-      /* ---------- 4단계 : 기다린 결과를 판정한다 ---------- */
+      /* ---------- 4단계 : 기다린 결과를 판정한다 ----------
+         적어 둔 순서가 곧 우선순위다. 꺼내기가 실패해도 계속 기다리도록
+         고친 뒤로는 표시 여러 개가 한꺼번에 서 있을 수 있어서,
+         어느 것을 먼저 보느냐가 결과를 가른다. */
       if (match_found != 0u)
       {
+        /* 도중에 꺼내기가 한 번 미끄러졌더라도(rx_fail 이 서 있더라도) 끝내
+           내 시험용 프레임을 받아 냈다면, 확인하려던 것 - 클럭·비트타이밍·
+           필터·수신 경로 - 은 전부 제대로 도는 것이다. 그러니 성공이 실패
+           표시를 이긴다. 이 순서가 뒤집히면 잠깐의 딸꾹질 하나 때문에
+           멀쩡한 보드가 고장으로 적힌다. */
         g_diag_can_loopback = 1u;
         printf("[CAN 자가진단] 결과 1 : 성공 - MCU 안쪽 CAN 설정은 정상입니다\r\n");
       }
       else if (rx_fail != 0u)
       {
-        g_diag_can_loopback = 3u;
-        printf("[CAN 자가진단] 결과 3 : 되돌아온 프레임을 꺼내지 못했습니다\r\n");
+        /* 예전에는 이 경우도 3 으로 적었다. 그래서 "아무것도 안 들어왔다"와
+           "들어오기는 했는데 꺼내지 못했다"가 진단 화면에서 똑같아 보였다.
+           앞은 배선·상대 노드를 봐야 하고 뒤는 수신함 다루는 쪽을 봐야 하는,
+           짚을 곳이 아주 다른 이야기라 번호를 따로 준다. */
+        g_diag_can_loopback = 5u;
+        printf("[CAN 자가진단] 결과 5 : 드레인 도중 수신함에서 프레임을 꺼내지 못했습니다 (시험용 프레임도 끝내 되돌아오지 않았습니다)\r\n");
       }
       else if (other_seen == 0u)
       {
@@ -912,6 +1039,40 @@ void StartImuTask(void const * argument)
   uint8_t  txDivider    = 0u;   /* IMU_TX_DIVIDER 번에 한 번만 보내려고 세는 값 */
   uint8_t  frameCounter = 0u;   /* 보낸 프레임에 붙이는 돌림 번호 */
 
+  /* ---------- 부팅 때의 I2C 사용이 끝나기를 먼저 기다린다 ----------
+     StartDefaultTask 가 hi2c1 을 다 쓰고 나서 넘겨주는 신호다.
+     (겹치면 왜 위험한지는 파일 위쪽 s_i2cScanDoneSem 선언부에 적어 두었다.)
+
+     [Mpu9255_Init() 바로 앞이 아니라 printf 보다 먼저 기다리는 이유]
+     I2C 를 실제로 건드리는 것은 Mpu9255_Init() 부터이니, 기다림을 그 바로 앞에
+     두어도 버스는 안전하다. 그런데도 아래 두 줄의 printf 보다 앞에 두었다.
+       1) 여기서 찍는 두 줄이 스캔 결과 127줄 사이에 끼어들어 뒤섞이면,
+          정작 봐야 할 스캔 출력이 읽기 어려워진다. 출력이 섞이는 것은
+          진단용 화면에서 생각보다 큰 손해다.
+       2) 아래 "자이로 영점을 재는 동안(약 1초) 보드를 움직이지 마세요" 는
+          지금 당장 움직이지 말라는 말이다. 스캔이 끝나기 1.5초쯤 전에 미리
+          찍어 두면, 정작 영점을 재는 순간에는 그 경고가 화면 저 위로 밀려나
+          아무도 지키지 않는 거짓말이 된다. 경고는 실제로 재기 직전에 나와야 한다.
+
+     [손잡이가 NULL 일 때의 대비책이 꼭 있어야 하는 이유]
+     힙이 6144바이트뿐이라 세마포어를 만들지 못하는 일이 생길 수 있다. 그런데
+     osSemaphoreWait() 는 NULL 을 받으면 기다리지 않고 osErrorParameter 만 그
+     자리에서 돌려준다. 그러면 막으려던 겹침이 아무 소리도 내지 않고 그대로
+     되살아난다. 그래서 그때는 StartDefaultTask 가 세워 주는 g_diag_scan_done 을
+     10ms 마다 들여다보며 같은 순서를 지킨다. 10ms 는 부팅 때 한 번뿐인 기다림이라
+     더 촘촘히 볼 이유가 없고, 그동안 다른 태스크에 자리를 내주는 값이다. */
+  if (s_i2cScanDoneSem != NULL)
+  {
+    (void)osSemaphoreWait(s_i2cScanDoneSem, osWaitForever);
+  }
+  else
+  {
+    while (g_diag_scan_done == 0u)
+    {
+      osDelay(10);
+    }
+  }
+
   printf("[IMU] 자세 추정을 시작합니다 (%ums 마다 표본, %ums 마다 CAN 0x%03X 송신)\r\n",
          (unsigned int)IMU_TASK_PERIOD_MS,
          (unsigned int)(IMU_TASK_PERIOD_MS * IMU_TX_DIVIDER),
@@ -920,7 +1081,9 @@ void StartImuTask(void const * argument)
 
   /* ---------- 센서를 깨우고 설정한 뒤 자이로 영점까지 잰다 (딱 한 번) ----------
      이 안에서 약 1초 동안 osDelay() 로 쉬어 가며 200번을 읽으므로,
-     그동안 다른 태스크(부팅 중이라면 I2C 스캔과 CAN 수신)는 정상으로 돌아간다. */
+     그동안 다른 태스크(CAN 수신 출력 등)는 정상으로 돌아간다.
+     위에서 신호를 받고 내려온 자리라 I2C 스캔은 이미 끝나 있다.
+     즉 지금 이 순간 hi2c1 을 쓰는 것은 이 태스크 하나뿐이다. */
   if (Mpu9255_Init() != 0u)
   {
     printf("[IMU] 준비 완료 : WHO_AM_I=0x%02X, 자이로 영점 측정을 마쳤습니다\r\n",
@@ -929,7 +1092,10 @@ void StartImuTask(void const * argument)
   else
   {
     /* 일부 단계가 실패해도 태스크를 멈추지는 않는다.
-       I2C 가 잠깐 겹쳐서 실패했을 뿐 곧 정상으로 돌아오는 경우가 많고,
+       (예전에는 여기 실패를 "I2C 가 잠깐 겹쳐서"로 설명했는데, 이제 버스를
+        넘겨받고 나서 부르는 자리라 겹침은 원인에서 빠진다. 남은 원인은
+        배선이 잠깐 접촉 불량이거나 센서가 아직 덜 깨어난 쪽이고,
+        그런 것들도 대개 곧 정상으로 돌아온다.)
        설령 계속 실패하더라도 상태 바이트의 0번 비트가 0 으로 나가므로
        받는 쪽이 "이 각도는 믿으면 안 된다"를 스스로 알아챌 수 있다. */
     printf("[IMU] 준비 중 일부 단계가 실패했습니다 : WHO_AM_I=0x%02X, 영점측정=%u\r\n",

@@ -83,11 +83,13 @@ static uint32_t         s_turnElapsedMs   = 0u; /* ARC/PIVOT 경과 시간 */
 static uint32_t         s_openCount       = 0u; /* 전방 개방 연속 확인 횟수 */
 static uint32_t         s_backupElapsedMs = 0u;
 
-/* 피벗 진입 순간에 찍어 두는 헤딩 스냅샷과, 그 시점에 IMU를 믿을 수 있었는지 여부.
- * 진입 때 한 번만 정해지므로 한 번의 피벗은 처음부터 끝까지 하나의 과회전 가드
- * 모드(각도 기반 / 시간 기반)만 사용하게 된다 */
+/* 피벗 진입 순간에 찍어 두는 헤딩 스냅샷과, "그 스냅샷을 실제로 믿을 수 있었는지" 여부.
+ * s_pivotYawBaseOk는 IMU 모듈이 지금 유효한지가 아니라 이번 피벗의 기준값
+ * (s_pivotYawStartDeg)이 쓸 만한 값인지를 기록한다 - 각도 기반 과회전 가드를 쓰려면
+ * 기준값이 진짜여야 하기 때문이다. 실제 가드 모드 선택은 여기에 더해 매 사이클
+ * 신선도(IsFresh)를 같이 보고 결정한다(AswAuto_HandlePivot 참조). */
 static float   s_pivotYawStartDeg = 0.0f;
-static uint8_t s_pivotYawValid    = 0u;
+static uint8_t s_pivotYawBaseOk   = 0u;
 
 /* 센서 EMA 필터 상태 */
 static uint32_t s_fLeft   = 0u;
@@ -128,9 +130,9 @@ void ASW_Autonomous_Init(void)
     s_sinceTurnMs     = 60000u;
 
     /* 자율모드 재진입 시 이전 주행에서 남은 피벗 기준 헤딩이 그대로 쓰이지 않도록 초기화.
-     * valid=0으로 시작하므로 첫 피벗은 스냅샷을 실제로 뜨기 전까지 시간 기반 가드를 쓴다 */
+     * baseOk=0으로 시작하므로 첫 피벗은 스냅샷을 실제로 뜨기 전까지 시간 기반 가드를 쓴다 */
     s_pivotYawStartDeg = 0.0f;
-    s_pivotYawValid    = 0u;
+    s_pivotYawBaseOk   = 0u;
 }
 
 /* ------------------------------------------------------------------------
@@ -191,11 +193,15 @@ static void AswAuto_EnterTurnState(AswAutoState_t state, AswAutoTurnDir_t dir)
 
     /* 제자리 피벗일 때만 회전각 측정 기준을 잡는다. 아크 선회(ARC_TURN)는 회전각이
      * 궤적 기하학으로 이미 90도 부근에 묶여 있어 과회전 가드 자체가 없으므로
-     * 스냅샷을 뜰 이유가 없다. valid도 여기서 같이 확정해 두어야 피벗 도중
-     * IMU가 뒤늦게 유효해져도 기준값과 가드 모드가 어긋나지 않는다. */
+     * 스냅샷을 뜰 이유가 없다.
+     * s_pivotYawBaseOk는 "IMU 모듈이 유효한가"가 아니라 "방금 뜬 이 기준값을 믿어도
+     * 되는가"를 기록한다 - 부팅 래치(IsValid)가 서 있더라도 프레임이 이미 끊긴
+     * 상태라면 여기서 읽은 yaw는 멈춰 있는 옛날 값이므로 기준으로 쓸 수 없다.
+     * 그래서 래치와 신선도를 둘 다 만족할 때만 1로 둔다. */
     if (state == ASW_AUTO_STATE_PIVOT)
     {
-        s_pivotYawValid    = ASW_ImuAttitude_IsValid();
+        s_pivotYawBaseOk   = ((ASW_ImuAttitude_IsValid() != 0u) &&
+                              (ASW_ImuAttitude_IsFresh(ASW_AUTO_PIVOT_IMU_MAX_AGE_MS) != 0u)) ? 1u : 0u;
         s_pivotYawStartDeg = ASW_ImuAttitude_GetYawDeg();
     }
 }
@@ -479,36 +485,56 @@ static void AswAuto_HandlePivot(uint32_t dist_front)
      * 더 느슨한 기준(WARNING_CM)만 만족해도 즉시 복귀시킨다.
      * (이제는 자이로가 있다 - remote IMU yaw가 CAN 0x120으로 올라오므로 실제로
      *  얼마나 돌았는지를 재서 EXPECT_DEG로 판정한다. 다만 부팅 직후 캘리브레이션
-     *  중이거나 CAN 링크가 아직 안 올라와 신뢰할 각도가 없을 수 있으므로, 기존
+     *  중이거나, CAN 링크가 아직 안 올라왔거나, 주행 도중 링크가 끊겨서 신뢰할
+     *  각도가 없을 수 있으므로, 기존
      *  시간 추정(EXPECT_MS)을 그대로 폴백으로 남겨 둔다. 각도를 못 믿는다고
      *  과회전 가드 자체가 사라지면 안 되기 때문 - 페일세이프는 항상 동작한다) */
-    uint8_t shouldForceExit = 0u;
-    /* 분기 기준은 "지금" IsValid()가 아니라 피벗 진입 때 찍어 둔 s_pivotYawValid다.
-     * 피벗이 IsValid()==false 인 상태에서 시작하면 s_pivotYawStartDeg에는 의미 없는
-     * 0.0f가 박힌다. 그 뒤 피벗 도중에 첫 캘리브레이션 프레임이 도착하면, 살아있는
-     * 검사를 쓸 경우 가드가 각도 분기로 넘어가면서 그 쓰레기 기준값에 대해 델타를
-     * 계산한다 - 실제 yaw 140도가 기준 0도와 비교되어 turnedAbsDeg = 140 >= 90이 되고,
-     * 거의 돌지도 않은 차에서 과회전 탈출이 잘못 발동한다. 진입 시점 스냅샷으로
-     * 분기하면 한 번의 피벗은 처음부터 끝까지 하나의 가드 모드만 쓴다: 기준값을
-     * 실제로 믿을 수 있을 때만 각도 기반, 아니면 시간 기반. IsValid()는 절대 풀리지
-     * 않으므로 false->true 전이만 가능하고, 이 분기가 정확히 그 경우를 막는다. */
-    if (s_pivotYawValid != 0u)
+    /* 가드 모드 선택 : "진입 시점 기준값이 믿을 만했는가"(s_pivotYawBaseOk)와
+     * "지금 이 순간 데이터가 살아 있는가"(IsFresh)를 둘 다 만족할 때만 각도 기반,
+     * 그 밖의 모든 조합은 시간 기반 폴백. 두 조건이 왜 각각 필요한지:
+     *
+     * [1] 신선도(IsFresh)는 왜 매 사이클 다시 확인하는가
+     *   ASW_ImuAttitude_IsValid()는 "원격이 캘리브레이션 완료를 처음 보고했다"를 한 번
+     *   세우고 절대 내리지 않는 단방향 부팅 래치이지, 링크가 살아 있다는 표시가 아니다.
+     *   주행 도중 CAN 링크가 끊기면 마지막으로 받은 yaw 값이 그대로 얼어붙는다 -
+     *   기준값과의 델타는 영원히 0 부근이라 각도 조건이 절대 성립하지 않는데,
+     *   래치는 계속 참이므로 시간 기반 폴백은 else 가지에 갇혀 영원히 도달할 수 없다.
+     *   즉 과회전 페일세이프 자체가 통째로 죽는다. 그래서 신선도만은 진입 때 찍어 둔
+     *   스냅샷이 아니라 매 사이클 다시 묻는다 - 데이터가 묵는 순간(수신 후
+     *   PIVOT_IMU_MAX_AGE_MS 경과) 바로 다음 50ms 주기부터 조건이 거짓이 되어
+     *   시간 기반 가지로 떨어지고, 페일세이프는 계속 살아 있다.
+     *
+     * [2] 그럼에도 진입 시점 스냅샷(s_pivotYawBaseOk)이 여전히 필요한 이유
+     *   믿을 자세 없이 피벗이 시작되면 s_pivotYawStartDeg에는 의미 없는 0.0f가 박힌다.
+     *   그 뒤 피벗 도중에 첫 캘리브레이션 프레임이 도착했을 때 순수하게 살아있는 검사만
+     *   쓴다면 가드가 각도 분기로 넘어가면서 그 쓰레기 기준값에 대해 델타를 계산한다 -
+     *   실제 yaw 140도가 기준 0.0f와 비교되어 turnedAbsDeg = 140 >= 90이 되고, 거의
+     *   돌지도 않은 차에서 과회전 탈출이 잘못 발동한다. s_pivotYawBaseOk가 바로 이
+     *   "가짜 승격"(시간 기반 -> 각도 기반)을 막는다. 반대 방향인 "강등"(각도 기반 ->
+     *   시간 기반)은 [1]대로 언제든 허용된다 - 기준값이 멀쩡했는데 데이터가 묵은
+     *   경우이므로, 더 보수적인 시간 가드로 내려가는 것은 항상 안전하다.
+     *
+     * 아래 조건의 ASW_ImuAttitude_IsValid()는 사실 s_pivotYawBaseOk가 이미 진입 때
+     * 요구했던 것이라 논리적으로 중복(함의)이다. 이 한 줄만 보고도 "각도를 쓰려면
+     * 유효+신선이 필요하다"가 읽히도록 가독성 목적으로만 남겨 둔다. */
+    uint8_t overturned = 0u;
+    if ((s_pivotYawBaseOk != 0u) &&
+        (ASW_ImuAttitude_IsValid() != 0u) &&
+        (ASW_ImuAttitude_IsFresh(ASW_AUTO_PIVOT_IMU_MAX_AGE_MS) != 0u))
     {
         /* 부호는 보지 않고 크기만 쓴다 - 좌/우 피벗 어느 쪽이든 "얼마나 돌았나"만
          * 필요하므로 IMU의 yaw 부호 규약에 의존하지 않는다 */
         float turnedDeg    = AswAuto_PivotYawDeltaDeg();
         float turnedAbsDeg = (turnedDeg < 0.0f) ? -turnedDeg : turnedDeg;
-        if (turnedAbsDeg >= ASW_AUTO_PIVOT_EXPECT_DEG && dist_front > ASW_AUTO_DIST_WARNING_CM)
-        {
-            shouldForceExit = 1u;
-        }
+        overturned = (turnedAbsDeg >= ASW_AUTO_PIVOT_EXPECT_DEG) ? 1u : 0u;
     }
-    else if (s_turnElapsedMs >= ASW_AUTO_PIVOT_EXPECT_MS && dist_front > ASW_AUTO_DIST_WARNING_CM)
+    else
     {
-        shouldForceExit = 1u;
+        overturned = (s_turnElapsedMs >= ASW_AUTO_PIVOT_EXPECT_MS) ? 1u : 0u;
     }
 
-    if (shouldForceExit != 0u)
+    /* 전방 여유(WARNING_CM) 조건과 탈출 동작은 두 가지 가드에 공통이므로 한 곳에만 둔다 */
+    if ((overturned != 0u) && (dist_front > ASW_AUTO_DIST_WARNING_CM))
     {
         /* 위와 동일한 이유로 정지 완충 후 다음 주기에 전진 복귀 */
         RTE_Motor_Stop();

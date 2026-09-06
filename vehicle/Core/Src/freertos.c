@@ -385,8 +385,11 @@ static uint8_t Can_TryBusOffRecover(void)
   stopStatus = HAL_CAN_Stop(&hcan);
 
   /* HAL_CAN_Start()는 State가 READY일 때만 성공한다.
-   * Stop이 정상적으로 끝나야 READY가 되므로 두 조건을 함께 확인한다. */
-  if ((stopStatus == HAL_OK) && (hcan.State == HAL_CAN_STATE_READY))
+   * HAL_CAN_Stop()은 성공 경로에서 반드시 State를 HAL_CAN_STATE_READY로 내려놓고
+   * HAL_OK를 반환하므로(벤더 HAL 소스 확인), stopStatus == HAL_OK 하나만으로
+   * READY가 보장된다. 예전에 함께 보던 (hcan.State == HAL_CAN_STATE_READY)는
+   * 항상 참인 중복 조건이라 제거했다. */
+  if (stopStatus == HAL_OK)
   {
     startStatus = HAL_CAN_Start(&hcan);
   }
